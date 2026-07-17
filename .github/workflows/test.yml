@@ -1,0 +1,104 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+env:
+  SECRET_KEY: ci-test-secret-key-not-for-production-use-only
+  ALLOWED_HOSTS: localhost
+  STORAGE_BUCKET_NAME: ci-test-bucket
+  STORAGE_ACCESS_KEY_ID: ci-test-key
+  STORAGE_SECRET_ACCESS_KEY: ci-test-secret
+  STORAGE_ENDPOINT_URL: http://localhost:0
+  STORAGE_REGION_NAME: us-east-1
+  EMAIL_HOST: localhost
+  EMAIL_HOST_USER: ci
+  EMAIL_HOST_PASSWORD: ci
+
+jobs:
+  # SQLite: local-dev convenience backend. Kept in CI so the two backends
+  # are never allowed to silently diverge, but it is NOT the backend that
+  # gates a change -- postgres is.
+  sqlite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements-dev.txt
+      - run: pytest
+        env:
+          DJANGO_SETTINGS_MODULE: config.settings.dev
+
+  # Postgres: the reference implementation for constraints, transactional
+  # behavior, and -- critically -- the row-level-security machine-field
+  # protection, which SQLite cannot express at all. Mandatory starting
+  # with the first domain-model change (fact_field / registry app).
+  #
+  # Two roles are provisioned to mirror production exactly: `migrator`
+  # owns the schema and runs migrations; `app_runtime` is the restricted
+  # role the test suite actually runs as, so a passing suite here is
+  # evidence the RLS policies genuinely restrict a non-owning role, not
+  # an artifact of tests running as the role that owns the tables.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: sunset_ledger
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements-dev.txt
+
+      - name: Provision migrator and app_runtime roles
+        run: |
+          psql -c "CREATE ROLE migrator LOGIN PASSWORD 'migrator' SUPERUSER;"
+          psql -c "CREATE ROLE app_runtime LOGIN PASSWORD 'app_runtime';"
+
+      # Pre-create and migrate the *test* database as migrator, then let
+      # the actual test run reuse it as app_runtime (--reuse-db) rather
+      # than letting the test runner create/own the schema itself -- if
+      # app_runtime created the tables, it would be their owner and RLS
+      # would not apply to it at all, silently defeating the point of
+      # this job.
+      - name: Create test database as migrator
+        run: psql -c "CREATE DATABASE test_sunset_ledger OWNER migrator;"
+
+      - name: Migrate test database as migrator
+        run: python manage.py migrate --noinput
+        env:
+          DJANGO_SETTINGS_MODULE: config.settings.prod
+          DATABASE_URL: postgres://migrator:migrator@localhost:5432/test_sunset_ledger
+
+      - name: Grant app_runtime access to migrator-owned schema
+        run: |
+          psql -d test_sunset_ledger -c "GRANT CONNECT ON DATABASE test_sunset_ledger TO app_runtime;"
+          psql -d test_sunset_ledger -c "GRANT USAGE ON SCHEMA public TO app_runtime;"
+          psql -d test_sunset_ledger -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_runtime;"
+          psql -d test_sunset_ledger -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_runtime;"
+
+      - name: Test as app_runtime (reusing the migrator-owned schema)
+        run: pytest --reuse-db
+        env:
+          DJANGO_SETTINGS_MODULE: config.settings.prod
+          DATABASE_URL: postgres://app_runtime:app_runtime@localhost:5432/test_sunset_ledger
