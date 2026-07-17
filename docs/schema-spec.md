@@ -289,19 +289,45 @@ different privileges directly, rather than asserting it indirectly.
 
 One concrete consequence worth documenting precisely: on Postgres, a
 `save()` call that attempts to modify a machine row as `app_runtime`
-surfaces as `IntegrityError`, not a clean rejection. Django's
-`_save_table()` (`django/db/models/base.py`) tries an `UPDATE` first and
-only falls back to `INSERT` "if that doesn't update anything" (its own
-comment). RLS's `USING` clause makes a machine-category row invisible to
-`app_runtime`'s `UPDATE` policy, so the `UPDATE` matches zero rows
-*without erroring* -- Postgres does not distinguish "no such row" from
-"row exists but you can't see it" for a permissive `USING`-clause
+surfaces as a `DatabaseError` (confirmed against a real run to be
+`ProgrammingError` specifically -- the RLS policy violation itself, not
+necessarily a downstream constraint collision), not a clean rejection.
+Django's `_save_table()` (`django/db/models/base.py`) tries an `UPDATE`
+first and only falls back to `INSERT` "if that doesn't update anything"
+(its own comment). RLS's `USING` clause makes a machine-category row
+invisible to `app_runtime`'s `UPDATE` policy, so the `UPDATE` matches zero
+rows *without erroring* -- Postgres does not distinguish "no such row"
+from "row exists but you can't see it" for a permissive `USING`-clause
 mismatch. Django reads the zero-row result as "this row doesn't exist
-yet" and attempts an `INSERT`, which then collides with the row's own,
-already-existing primary key. This was confirmed by reading Django's
-`_save_table` source directly, not inferred from the symptom alone -- it
-is a real Django/RLS interaction, not test isolation, fixture state, or
-object state, and it is not masked with `force_update`.
+yet" and attempts an `INSERT` with the existing primary key, which
+Postgres then rejects -- either the INSERT policy's `WITH CHECK` clause or
+plain primary-key uniqueness, depending on the specific values involved,
+which is exactly why tests assert the broad `DatabaseError` rather than a
+specific subclass. This was confirmed by reading Django's `_save_table`
+source directly, not inferred from the symptom alone -- it is a real
+Django/RLS interaction, not test isolation, fixture state, or object
+state, and it is not masked with `force_update`.
+
+**Transaction isolation when testing this.** Postgres aborts the entire
+enclosing transaction after any error within it (unlike SQLite) -- a test
+that triggers an RLS rejection and then tries a follow-up assertion
+(`refresh_from_db()`, a confirming `SELECT`) on the same transaction will
+find *that* fails too, with "current transaction is aborted," masking the
+real result. Every deliberately-failing statement in
+`test_fact_field_rls_postgres.py` is wrapped in its own
+`transaction.atomic()` savepoint for exactly this reason -- it rolls back
+to the savepoint automatically once the exception propagates out, leaving
+the outer test transaction usable again for the assertions that follow.
+
+**Validation vs. RLS are two distinct, independently-tested layers.**
+Attempting to flip a descriptive row into a machine row through
+`model.save()` is caught by `FactField.clean()` (`machine_key` must be one
+of the frozen `MACHINE_KEYS`) and raises `ValidationError` *before* any
+SQL is sent -- this is the application layer, not RLS, catching it. A
+separate test bypasses `clean()` entirely (via `QuerySet.update()`, which
+never calls it) to prove RLS *independently* rejects the same transition
+via its `WITH CHECK` clause, regardless of what application-level
+validation would have said.
 
 ## Alert delivery lifecycle
 

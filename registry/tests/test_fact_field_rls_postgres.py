@@ -12,24 +12,44 @@ equivalent SQLite-only positive controls (the guard genuinely permitting
 a write when it's the only enforcement layer) live in test_fact_field.py
 and test_fact_field_bulk_operations.py.
 
-Root-cause note on why save() surfaces as IntegrityError rather than a
-clean rejection: Django's Model._save_table() (django/db/models/base.py)
-tries an UPDATE first and only falls back to INSERT "if that doesn't
-update anything" (its own comment). RLS's USING clause makes a
-machine-category row invisible to app_runtime's UPDATE policy, so the
-UPDATE matches zero rows *without erroring* -- Postgres does not
-distinguish "no such row" from "row exists but you can't see it" for a
-permissive USING-clause mismatch. Django reads that as "the row doesn't
-exist yet" and attempts an INSERT, which then collides with the
-already-existing primary key. Confirmed by reading _save_table's source
-directly, not inferred from symptoms alone -- this is a real Django/RLS
-interaction, not test isolation, fixture state, or object state.
+Two things confirmed against a real run, not assumed:
+
+1. Exception class. RLS rejections surface as `ProgrammingError` (a
+   `DatabaseError` subclass), not `IntegrityError` specifically -- assert
+   the broad `django.db.DatabaseError`, since the exact sub-mechanism
+   (an RLS policy violation vs. a downstream primary-key collision) can
+   legitimately differ per operation and per which values are involved,
+   and both are DatabaseError.
+
+2. Transaction isolation. Postgres aborts the *entire* enclosing
+   transaction after any error within it (unlike SQLite) -- without an
+   inner savepoint, a test's own follow-up assertions (refresh_from_db(),
+   a confirming SELECT) would themselves fail with "current transaction
+   is aborted" rather than actually verifying anything. Every deliberately
+   failing statement is therefore wrapped in its own transaction.atomic(),
+   which rolls back to a savepoint automatically when the exception
+   propagates out, leaving the outer test transaction usable again.
+
+Root-cause note on the INSERT-fallback behavior (still accurate, only the
+expected exception class was wrong): Django's Model._save_table()
+(django/db/models/base.py) tries an UPDATE first and only falls back to
+INSERT "if that doesn't update anything" (its own comment). RLS's USING
+clause makes a machine-category row invisible to app_runtime's UPDATE
+policy, so the UPDATE matches zero rows *without erroring* -- Postgres
+does not distinguish "no such row" from "row exists but you can't see
+it" for a permissive USING-clause mismatch. Django reads that as "the row
+doesn't exist yet" and attempts an INSERT with the existing primary key,
+which Postgres then rejects -- either the INSERT policy's WITH CHECK
+clause or plain primary-key uniqueness, depending on what values are
+being inserted. This is understood, confirmed behavior; it does not
+require force_update or any model change.
 """
 
 import os
 
 import pytest
-from django.db import DatabaseError, IntegrityError
+from django.db import DatabaseError, transaction
+from django.core.exceptions import ValidationError
 
 from registry.models import FactField
 from registry.services import system_fields
@@ -42,32 +62,46 @@ pytestmark = [
 
 
 def _attempt(fn):
-    """Postgres surfaces an RLS rejection differently per operation: a
-    USING-clause mismatch (row exists but isn't targetable) silently
-    matches zero rows; a WITH CHECK violation (row targetable, but the
-    new values are disallowed) raises. Both are acceptable proof the
-    write had no effect -- only the persisted state is asserted after."""
-    try:
-        fn()
-    except DatabaseError:
-        pass
+    """Run fn expecting a DatabaseError, inside its own savepoint.
+
+    The savepoint (transaction.atomic() nested inside the test's own
+    outer transaction) is not optional: Postgres aborts the whole
+    enclosing transaction after any error, so without it, the assertions
+    that follow this call would themselves fail with "current transaction
+    is aborted" instead of actually checking anything. atomic() rolls
+    back to the savepoint automatically once the exception propagates out
+    of the `with` block, leaving the outer transaction usable again.
+    """
+    with pytest.raises(DatabaseError):
+        with transaction.atomic():
+            fn()
 
 
 class TestAppRuntimeCannotBypassRlsViaGuardContext:
     def test_save_cannot_modify_a_machine_row(self):
         field = FactField.objects.get(machine_key="end_date")
-        original = field.description
+        original_description = field.description
         with system_fields.allow_system_field_mutation():
             field.description = "attempted change"
-            with pytest.raises(IntegrityError):
-                field.save()
+            _attempt(field.save)
         field.refresh_from_db()
-        assert field.description == original
+        assert field.category == FactField.Category.MACHINE
+        assert field.machine_key == "end_date"
+        assert field.description == original_description
 
     def test_delete_cannot_remove_a_machine_row(self):
+        # Unlike the operations above, a DELETE whose target row is
+        # invisible under RLS's USING clause simply matches zero rows --
+        # a clean, non-erroring no-op, not a transaction-aborting error.
+        # No savepoint needed here; nothing raises.
         with system_fields.allow_system_field_mutation():
-            _attempt(FactField.objects.get(machine_key="end_date").delete)
-        assert FactField.objects.filter(machine_key="end_date").exists()
+            try:
+                FactField.objects.get(machine_key="end_date").delete()
+            except DatabaseError:
+                pass
+        field = FactField.objects.get(machine_key="end_date")
+        assert field.category == FactField.Category.MACHINE
+        assert field.machine_key == "end_date"
 
     def test_bulk_create_cannot_introduce_a_machine_row(self):
         with system_fields.allow_system_field_mutation():
@@ -81,54 +115,83 @@ class TestAppRuntimeCannotBypassRlsViaGuardContext:
 
     def test_bulk_update_cannot_modify_a_machine_row(self):
         field = FactField.objects.get(machine_key="end_date")
-        original = field.description
+        original_description = field.description
         with system_fields.allow_system_field_mutation():
             field.description = "attempted bulk_update change"
             _attempt(lambda: FactField.objects.bulk_update([field], ["description"]))
         field.refresh_from_db()
-        assert field.description == original
+        assert field.category == FactField.Category.MACHINE
+        assert field.machine_key == "end_date"
+        assert field.description == original_description
 
     def test_queryset_update_cannot_modify_a_machine_row(self):
-        original = FactField.objects.get(machine_key="end_date").description
+        original_description = FactField.objects.get(machine_key="end_date").description
         with system_fields.allow_system_field_mutation():
             _attempt(lambda: FactField.objects.filter(machine_key="end_date").update(
                 description="attempted queryset update"
             ))
-        assert FactField.objects.get(machine_key="end_date").description == original
+        field = FactField.objects.get(machine_key="end_date")
+        assert field.category == FactField.Category.MACHINE
+        assert field.machine_key == "end_date"
+        assert field.description == original_description
 
     def test_queryset_delete_cannot_remove_a_machine_row(self):
         with system_fields.allow_system_field_mutation():
             _attempt(lambda: FactField.objects.filter(machine_key="end_date").delete())
-        assert FactField.objects.filter(machine_key="end_date").exists()
+        field = FactField.objects.get(machine_key="end_date")
+        assert field.category == FactField.Category.MACHINE
+        assert field.machine_key == "end_date"
 
     def test_cannot_flip_machine_row_into_descriptive(self):
-        # USING-clause mismatch (existing row is category='machine', fails
-        # app_runtime's UPDATE policy) -- same silent-then-insert-collision
-        # mechanism as test_save_cannot_modify_a_machine_row above.
+        # Existing row's category is 'machine' -- fails app_runtime's
+        # UPDATE USING clause (row not targetable at all), same silent
+        # zero-row-then-insert-collision mechanism as the save() test
+        # above.
         field = FactField.objects.get(machine_key="end_date")
         with system_fields.allow_system_field_mutation():
             field.category = FactField.Category.DESCRIPTIVE
             field.machine_key = None
-            with pytest.raises(IntegrityError):
-                field.save()
+            _attempt(field.save)
         field.refresh_from_db()
         assert field.category == FactField.Category.MACHINE
+        assert field.machine_key == "end_date"
 
-    def test_cannot_flip_descriptive_row_into_machine(self):
-        # WITH CHECK violation, not a USING mismatch: the row *is*
-        # currently descriptive (visible/targetable), but the new values
-        # would set category='machine', which fails the UPDATE policy's
-        # WITH CHECK (category='descriptive') -- Postgres raises for this
-        # directly rather than silently matching zero rows.
+    def test_cannot_flip_descriptive_row_into_machine_via_save(self):
+        # This is caught by FactField.clean() -- machine_key must be one
+        # of the frozen MACHINE_KEYS -- entirely at the *application*
+        # layer, before any SQL is sent. It is a genuinely different,
+        # earlier line of defense than RLS, and must not be conflated
+        # with it: this test proves validation catches it; the next test
+        # proves RLS *independently* catches the same transition when
+        # validation is bypassed entirely.
         descriptive = FactField.objects.create(
-            code="pg_flip_target", category=FactField.Category.DESCRIPTIVE,
+            code="pg_flip_target_via_save", category=FactField.Category.DESCRIPTIVE,
             value_type=FactField.ValueType.TEXT,
         )
         with system_fields.allow_system_field_mutation():
             descriptive.category = FactField.Category.MACHINE
             descriptive.machine_key = "pg_escape_attempt_2"
-            with pytest.raises(DatabaseError):
+            with pytest.raises(ValidationError):
                 descriptive.save()
+        descriptive.refresh_from_db()
+        assert descriptive.category == FactField.Category.DESCRIPTIVE
+
+    def test_rls_independently_blocks_descriptive_to_machine_flip_when_validation_is_bypassed(self):
+        # QuerySet.update() never calls clean()/full_clean() -- this
+        # bypasses the application-level validation from the test above
+        # entirely, so a rejection here can only be RLS: the row is
+        # currently descriptive (visible/targetable under the UPDATE
+        # USING clause), but the new value (category='machine') violates
+        # the UPDATE policy's WITH CHECK clause, which Postgres enforces
+        # regardless of what Django-level validation would have said.
+        descriptive = FactField.objects.create(
+            code="pg_flip_target_bypass_validation", category=FactField.Category.DESCRIPTIVE,
+            value_type=FactField.ValueType.TEXT,
+        )
+        with system_fields.allow_system_field_mutation():
+            _attempt(lambda: FactField.objects.filter(pk=descriptive.pk).update(
+                category=FactField.Category.MACHINE
+            ))
         descriptive.refresh_from_db()
         assert descriptive.category == FactField.Category.DESCRIPTIVE
 
@@ -177,15 +240,18 @@ class TestMigratorRoleIntegration:
             conn.commit()
 
         # migrator's write took effect -- confirmed via app_runtime's own
-        # connection (SELECT is open to everyone under RLS).
+        # connection (SELECT is open to everyone under RLS). This
+        # assertion is preserved unchanged from the previous version; only
+        # the follow-up app_runtime failure expectation below changed.
         field = FactField.objects.get(machine_key="start_date")
         assert field.description == "altered by migrator directly"
 
-        # app_runtime still cannot write to it, even after migrator's change,
-        # and even inside the Python guard context.
+        # app_runtime still cannot write to it, even after migrator's
+        # change, and even inside the Python guard context.
         with system_fields.allow_system_field_mutation():
             field.description = "attempted app_runtime edit after migrator's change"
-            with pytest.raises(IntegrityError):
-                field.save()
+            _attempt(field.save)
         field.refresh_from_db()
+        assert field.category == FactField.Category.MACHINE
+        assert field.machine_key == "start_date"
         assert field.description == "altered by migrator directly"
