@@ -415,6 +415,53 @@ the v1 malware-scanning policy (not yet implemented -- documented as a
 known gap, mitigated by quarantine-until-reviewed + forced content-type
 serving, not silently ignored).
 
+## Implementation notes: agreement/document slice
+
+Implemented: `agreement`, `agreement_relationship`, `document`,
+`document_agreement`, `document_relationship`, plus `document`'s archival
+retry metadata. Not yet implemented: `fact` and everything downstream of
+it (qualifiers, corroboration, disputes, verification, deadline
+computation), `submission`, `subscription`, `alert_log`,
+`agreement_status_override`, `document_history`.
+
+- **`agreement.status` is deliberately absent, not stubbed.** Status is
+  derived from facts (`cancellation_effective_date`,
+  `termination_effective_date`, `end_date`, `start_date`) that don't
+  exist yet. A placeholder field would either be a fake manually-set
+  column (violating "derived, not mutable") or an unpopulatable derived
+  one -- omitting it entirely until the `fact` slice avoids both.
+- **Deletion protection is two-layered, and the layers are genuinely
+  independent.** Every FK into `agreement`/`document` from this slice's
+  other tables uses `PROTECT` -- real, database-enforced protection once
+  any relationship exists. For the gap that leaves (a freshly-created,
+  currently unreferenced row), both models' `delete()` and their
+  QuerySets' `delete()` unconditionally raise
+  `registry.services.integrity.RecordDeletionNotAllowed` -- directly
+  reusing this project's own lesson from `FactField`'s bulk-operation
+  gap, where `QuerySet.delete()` bypassed an instance-level guard
+  entirely. Unlike `FactField`, there is no escape-hatch context manager
+  here: no migration ever legitimately needs to delete an agreement or
+  document. Full, independent protection arrives with `fact` slice, once
+  `fact.primary_document_id` is a real `PROTECT`-ed reference.
+- **`document.content_sha256` is indexed but not unique**, by design --
+  identical hashes are permitted; duplicates are resolved editorially via
+  `document_relationship(duplicate_of)`, never rejected at insert.
+- **Document immutability is an editorial convention in this slice, not a
+  hard field lock.** "Archived bytes are immutable, corrections create a
+  new document" governs workflow (link corrections via
+  `document_relationship`), not a `FactField`-style write guard --
+  nothing in this slice's requirements calls for one, and admin-based
+  data entry (no upload flow yet) benefits from ordinary editability
+  before publication. The `wayback_*` fields are explicitly expected to
+  change repeatedly via the future `archive_sources` retry command.
+- **A model's own `save()` calling `full_clean()` means uniqueness
+  violations surface as `ValidationError`, not `IntegrityError`, on the
+  ordinary `.create()` path** -- Django's `validate_unique()` runs before
+  any SQL is sent. Every such constraint also has a companion test that
+  bypasses `full_clean()` (via `_base_manager.bulk_create()`) to prove
+  the database constraint itself is real, independent of the
+  application-level check duplicating it.
+
 ## Milestones
 
 - **Milestone 1 (technical deployment):** full schema, deadline engine

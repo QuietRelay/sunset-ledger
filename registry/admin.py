@@ -1,6 +1,17 @@
 from django.contrib import admin
 
-from .models import FactField, Jurisdiction, Reviewer, Vendor, VendorAlias
+from .models import (
+    Agreement,
+    AgreementRelationship,
+    Document,
+    DocumentAgreement,
+    DocumentRelationship,
+    FactField,
+    Jurisdiction,
+    Reviewer,
+    Vendor,
+    VendorAlias,
+)
 
 
 @admin.register(Jurisdiction)
@@ -49,3 +60,67 @@ class FactFieldAdmin(admin.ModelAdmin):
         if obj is not None and obj.category == FactField.Category.MACHINE:
             return False
         return super().has_delete_permission(request, obj)
+
+
+class NeverDeletableAdminMixin:
+    """Agreement and Document raise RecordDeletionNotAllowed at the model
+    layer regardless -- this just gives a consistent UI signal (no delete
+    button/action at all) instead of a raised exception after the fact."""
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def get_actions(self, request):
+        actions = super().get_actions(request)
+        actions.pop("delete_selected", None)
+        return actions
+
+
+@admin.register(Agreement)
+class AgreementAdmin(NeverDeletableAdminMixin, admin.ModelAdmin):
+    list_display = ("__str__", "jurisdiction", "vendor", "agreement_type", "parent_agreement")
+    list_filter = ("agreement_type", "jurisdiction__state")
+    search_fields = ("jurisdiction__name", "vendor__canonical_name", "scope_note")
+    autocomplete_fields = ("jurisdiction", "vendor", "parent_agreement")
+
+
+@admin.register(AgreementRelationship)
+class AgreementRelationshipAdmin(admin.ModelAdmin):
+    list_display = ("from_agreement", "relationship_type", "to_agreement", "created_at")
+    list_filter = ("relationship_type",)
+    autocomplete_fields = ("from_agreement", "to_agreement")
+
+
+class DocumentAgreementInline(admin.TabularInline):
+    model = DocumentAgreement
+    extra = 1
+    autocomplete_fields = ("agreement",)
+
+
+@admin.register(Document)
+class DocumentAdmin(NeverDeletableAdminMixin, admin.ModelAdmin):
+    list_display = (
+        "__str__", "document_type", "date_obtained", "acquisition_method",
+        "wayback_status", "unredacted_copy_status",
+    )
+    list_filter = ("document_type", "acquisition_method", "wayback_status", "unredacted_copy_status")
+    search_fields = ("archived_storage_key", "content_sha256", "original_url")
+    readonly_fields = (
+        "wayback_status", "wayback_attempts", "wayback_last_attempt_at",
+        "wayback_last_error", "wayback_url", "wayback_saved_at", "next_archive_attempt_at",
+    )
+    inlines = [DocumentAgreementInline]
+
+
+@admin.register(DocumentRelationship)
+class DocumentRelationshipAdmin(admin.ModelAdmin):
+    list_display = ("from_document", "relationship_type", "to_document", "created_at")
+    list_filter = ("relationship_type",)
+    autocomplete_fields = ("from_document", "to_document")
+
+
+@admin.register(DocumentAgreement)
+class DocumentAgreementAdmin(admin.ModelAdmin):
+    list_display = ("document", "agreement", "relationship_role", "created_at")
+    list_filter = ("relationship_role",)
+    autocomplete_fields = ("document", "agreement")

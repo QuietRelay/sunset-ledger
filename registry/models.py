@@ -1,10 +1,16 @@
 import unicodedata
 
 from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
 from django.db import models
 from django.utils.text import slugify
 
-from registry.services import system_fields
+from registry.services import integrity, system_fields
+
+SHA256_HEX_VALIDATOR = RegexValidator(
+    regex=r"^[a-f0-9]{64}$",
+    message="Must be a 64-character lowercase hexadecimal SHA-256 digest.",
+)
 
 US_STATE_CHOICES = [
     ("AL", "Alabama"), ("AK", "Alaska"), ("AZ", "Arizona"), ("AR", "Arkansas"),
@@ -343,3 +349,357 @@ class FactField(models.Model):
     def delete(self, *args, **kwargs):
         self._guard()
         super().delete(*args, **kwargs)
+
+
+class AgreementQuerySet(models.QuerySet):
+    """See registry.services.integrity -- agreements are never
+    hard-deleted in v1, on either the instance or the bulk path."""
+
+    def delete(self):
+        raise integrity.RecordDeletionNotAllowed(
+            "Agreements are never hard-deleted in v1 -- see docs/schema-spec.md."
+        )
+
+
+class Agreement(models.Model):
+    """One distinct contractual/procurement instrument -- not "this
+    jurisdiction's relationship with this vendor". A jurisdiction can have
+    multiple simultaneous or sequential agreements with the same vendor;
+    each is its own row.
+
+    Deliberately holds no mutable contract terms (dates, prices, camera
+    counts, renewal clauses) -- those are facts, not built yet. Also
+    deliberately holds no `status`: status is derived from facts
+    (cancellation_effective_date, termination_effective_date, end_date,
+    start_date) that don't exist until the fact slice, so there is
+    nothing yet to derive it from. See docs/schema-spec.md.
+    """
+
+    class AgreementType(models.TextChoices):
+        MASTER_AGREEMENT = "master_agreement", "Master agreement"
+        PARTICIPATING_AGREEMENT = "participating_agreement", "Participating agreement"
+        STANDALONE_AGREEMENT = "standalone_agreement", "Standalone agreement"
+        TASK_ORDER = "task_order", "Task order"
+
+    jurisdiction = models.ForeignKey(Jurisdiction, on_delete=models.PROTECT, related_name="agreements")
+    vendor = models.ForeignKey(Vendor, on_delete=models.PROTECT, related_name="agreements")
+    agreement_type = models.CharField(max_length=24, choices=AgreementType.choices)
+    parent_agreement = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.PROTECT, related_name="participating_agreements",
+    )
+    scope_note = models.TextField(
+        blank=True,
+        help_text="Short factual description of what this instrument covers, "
+                   "e.g. 'ALPR cameras, Police Dept'.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = AgreementQuerySet.as_manager()
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(parent_agreement__isnull=True) | ~models.Q(parent_agreement=models.F("id")),
+                name="agreement_parent_not_self",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["jurisdiction", "vendor"], name="agreement_juris_vendor_idx"),
+        ]
+        ordering = ["jurisdiction", "vendor", "id"]
+
+    def __str__(self):
+        return f"{self.jurisdiction} / {self.vendor} ({self.get_agreement_type_display()})"
+
+    def clean(self):
+        if self.agreement_type == self.AgreementType.MASTER_AGREEMENT and self.parent_agreement_id:
+            raise ValidationError("A master_agreement cannot itself have a parent_agreement.")
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise integrity.RecordDeletionNotAllowed(
+            "Agreements are never hard-deleted in v1 -- see docs/schema-spec.md."
+        )
+
+
+class AgreementRelationship(models.Model):
+    """Non-hierarchical relationships between agreements. Hierarchical
+    master/participating relationships use Agreement.parent_agreement
+    instead -- this table is for everything else."""
+
+    class RelationshipType(models.TextChoices):
+        REPLACES = "replaces", "Replaces"
+        RENEWED_AS_NEW_PROCUREMENT = "renewed_as_new_procurement", "Renewed as new procurement"
+        RELATED_DEPARTMENT_ARRANGEMENT = "related_department_arrangement", "Related department arrangement"
+        CONSOLIDATED_FROM = "consolidated_from", "Consolidated from"
+
+    from_agreement = models.ForeignKey(
+        Agreement, on_delete=models.PROTECT, related_name="outgoing_relationships",
+    )
+    to_agreement = models.ForeignKey(
+        Agreement, on_delete=models.PROTECT, related_name="incoming_relationships",
+    )
+    relationship_type = models.CharField(max_length=32, choices=RelationshipType.choices)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(from_agreement=models.F("to_agreement")),
+                name="agree_rel_no_self_link",
+            ),
+            models.UniqueConstraint(
+                fields=["from_agreement", "to_agreement", "relationship_type"],
+                name="uniq_agree_rel_directional",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.from_agreement} -{self.get_relationship_type_display()}-> {self.to_agreement}"
+
+    def clean(self):
+        if self.from_agreement_id and self.from_agreement_id == self.to_agreement_id:
+            raise ValidationError("An agreement cannot have a relationship to itself.")
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class DocumentQuerySet(models.QuerySet):
+    """See registry.services.integrity -- documents are never
+    hard-deleted in v1, on either the instance or the bulk path."""
+
+    def delete(self):
+        raise integrity.RecordDeletionNotAllowed(
+            "Documents are never hard-deleted in v1 -- see docs/schema-spec.md."
+        )
+
+
+class Document(models.Model):
+    """An archived artifact (contract, amendment, agenda packet, etc.).
+    Archived bytes at `archived_storage_key` are treated as immutable by
+    editorial convention -- corrections create a new Document linked via
+    DocumentRelationship(corrected_version_of), rather than editing this
+    row's content-identifying fields in place. That convention is not
+    enforced as a hard field lock in this slice (no requirement calls for
+    one, and admin-based data entry benefits from ordinary editability
+    before publication); `wayback_*` fields are explicitly expected to
+    change repeatedly via the future archive_sources retry command.
+
+    `content_sha256` is intentionally NOT unique -- identical hashes are
+    permitted and resolved editorially via DocumentRelationship(duplicate_of),
+    never rejected at insert. See docs/schema-spec.md.
+    """
+
+    class DocumentType(models.TextChoices):
+        ORIGINAL_AGREEMENT = "original_agreement", "Original agreement"
+        AMENDMENT = "amendment", "Amendment"
+        EXTENSION = "extension", "Extension"
+        PURCHASE_ORDER = "purchase_order", "Purchase order"
+        COUNCIL_APPROVAL = "council_approval", "Council approval"
+        AGENDA_PACKET = "agenda_packet", "Agenda packet"
+        MINUTES = "minutes", "Minutes"
+        INVOICE = "invoice", "Invoice"
+        RECORDS_RESPONSE = "records_response", "Records response"
+        NEWS_ARTICLE = "news_article", "News article"
+
+    class AcquisitionMethod(models.TextChoices):
+        PUBLIC_RECORDS_REQUEST = "public_records_request", "Public records request"
+        AGENDA_PACKET = "agenda_packet", "Agenda packet"
+        NEWS_COVERAGE = "news_coverage", "News coverage"
+        VENDOR_PRESS_RELEASE = "vendor_press_release", "Vendor press release"
+        DIRECT_SUBMISSION = "direct_submission", "Direct submission"
+        OTHER = "other", "Other"
+
+    class RedactionPerformedBy(models.TextChoices):
+        SOURCE_AGENCY = "source_agency", "Source agency"
+        PROJECT = "project", "Project"
+        UNKNOWN = "unknown", "Unknown"
+
+    class UnredactedCopyStatus(models.TextChoices):
+        NOT_APPLICABLE = "not_applicable", "Not applicable"
+        RETAINED_RESTRICTED = "retained_restricted", "Retained (restricted)"
+        DELETED = "deleted", "Deleted"
+
+    class WaybackStatus(models.TextChoices):
+        PENDING = "pending", "Pending"
+        SUCCEEDED = "succeeded", "Succeeded"
+        FAILED = "failed", "Failed"
+
+    # --- core identity / archival ---
+    document_type = models.CharField(max_length=24, choices=DocumentType.choices)
+    original_url = models.URLField(blank=True)
+    archived_storage_key = models.CharField(max_length=500, unique=True)
+    content_sha256 = models.CharField(max_length=64, validators=[SHA256_HEX_VALIDATOR])
+    file_size_bytes = models.PositiveBigIntegerField()
+    mime_type = models.CharField(max_length=100)
+    document_date = models.DateField(null=True, blank=True)
+    date_obtained = models.DateField()
+    acquisition_method = models.CharField(max_length=24, choices=AcquisitionMethod.choices)
+
+    # --- distinct dates for retroactive-effect handling (see fact.effective_date_basis, future slice) ---
+    vote_or_approval_date = models.DateField(null=True, blank=True)
+    execution_date = models.DateField(null=True, blank=True)
+    stated_effective_date = models.DateField(null=True, blank=True)
+
+    # --- privacy / redaction (frozen retention rule) ---
+    contains_personal_info = models.BooleanField(default=False)
+    redaction_performed_by = models.CharField(
+        max_length=16, choices=RedactionPerformedBy.choices, null=True, blank=True,
+    )
+    redaction_note = models.TextField(blank=True)
+    unredacted_copy_status = models.CharField(
+        max_length=24, choices=UnredactedCopyStatus.choices, default=UnredactedCopyStatus.NOT_APPLICABLE,
+    )
+    unredacted_copy_sha256 = models.CharField(
+        max_length=64, null=True, blank=True, validators=[SHA256_HEX_VALIDATOR],
+    )
+    unredacted_copy_deleted_at = models.DateTimeField(null=True, blank=True)
+    unredacted_retention_reason = models.TextField(blank=True)
+    unredacted_access_policy = models.CharField(max_length=255, blank=True)
+
+    # --- archival retry metadata ---
+    wayback_status = models.CharField(max_length=16, choices=WaybackStatus.choices, default=WaybackStatus.PENDING)
+    wayback_attempts = models.PositiveIntegerField(default=0)
+    wayback_last_attempt_at = models.DateTimeField(null=True, blank=True)
+    wayback_last_error = models.TextField(blank=True)
+    wayback_url = models.URLField(blank=True)
+    wayback_saved_at = models.DateTimeField(null=True, blank=True)
+    next_archive_attempt_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = DocumentQuerySet.as_manager()
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["content_sha256"], name="document_sha256_idx"),
+            models.Index(fields=["wayback_status", "next_archive_attempt_at"], name="document_archive_retry_idx"),
+            models.Index(fields=["document_date"], name="document_document_date_idx"),
+            models.Index(fields=["date_obtained"], name="document_date_obtained_idx"),
+        ]
+        ordering = ["-date_obtained", "id"]
+
+    def __str__(self):
+        return f"{self.get_document_type_display()} ({self.content_sha256[:12]}...)"
+
+    def clean(self):
+        if self.redaction_performed_by == self.RedactionPerformedBy.PROJECT and not self.redaction_note:
+            raise ValidationError(
+                "redaction_note is required when redaction_performed_by='project'."
+            )
+        if (
+            self.unredacted_copy_status == self.UnredactedCopyStatus.RETAINED_RESTRICTED
+            and not self.unredacted_retention_reason
+        ):
+            raise ValidationError(
+                "unredacted_retention_reason is required when "
+                "unredacted_copy_status='retained_restricted'."
+            )
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise integrity.RecordDeletionNotAllowed(
+            "Documents are never hard-deleted in v1 -- see docs/schema-spec.md."
+        )
+
+
+class DocumentRelationship(models.Model):
+    """Relationships between documents. `from` reads as the subject,
+    `to` as the object -- see each type's docstring line for exact
+    directionality:
+
+    - redacted_version_of:  from = the redacted copy, to = the original
+    - corrected_version_of: from = the corrected copy, to = the earlier version
+    - ocr_derived_from:     from = the OCR text/output, to = the source scan
+    - duplicate_of:         from = the duplicate, to = the canonical copy
+    - replacement_for:      from = the new replacement, to = the old copy
+    - attachment_to:        from = the attachment, to = the main document
+    """
+
+    class RelationshipType(models.TextChoices):
+        REDACTED_VERSION_OF = "redacted_version_of", "Redacted version of"
+        CORRECTED_VERSION_OF = "corrected_version_of", "Corrected version of"
+        OCR_DERIVED_FROM = "ocr_derived_from", "OCR derived from"
+        DUPLICATE_OF = "duplicate_of", "Duplicate of"
+        REPLACEMENT_FOR = "replacement_for", "Replacement for"
+        ATTACHMENT_TO = "attachment_to", "Attachment to"
+
+    from_document = models.ForeignKey(
+        Document, on_delete=models.PROTECT, related_name="outgoing_relationships",
+    )
+    to_document = models.ForeignKey(
+        Document, on_delete=models.PROTECT, related_name="incoming_relationships",
+    )
+    relationship_type = models.CharField(max_length=24, choices=RelationshipType.choices)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(from_document=models.F("to_document")),
+                name="doc_rel_no_self_link",
+            ),
+            models.UniqueConstraint(
+                fields=["from_document", "to_document", "relationship_type"],
+                name="uniq_doc_rel_directional",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.from_document_id} -{self.get_relationship_type_display()}-> {self.to_document_id}"
+
+    def clean(self):
+        if self.from_document_id and self.from_document_id == self.to_document_id:
+            raise ValidationError("A document cannot have a relationship to itself.")
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class DocumentAgreement(models.Model):
+    """Many-to-many link between documents and agreements. One document
+    may support multiple agreements (e.g. a countywide master agreement
+    covering several participating agreements' own documentation trail).
+
+    This is NOT field-level provenance -- it only says "this document is
+    associated with this agreement," nothing about which specific claims
+    it supports. Field-level citation is fact.primary_document_id, in the
+    future fact slice.
+    """
+
+    class RelationshipRole(models.TextChoices):
+        GOVERNING_INSTRUMENT = "governing_instrument", "Governing instrument"
+        AMENDMENT = "amendment", "Amendment"
+        APPROVAL_RECORD = "approval_record", "Approval record"
+        PRICING_SCHEDULE = "pricing_schedule", "Pricing schedule"
+        SUPPORTING_RECORD = "supporting_record", "Supporting record"
+
+    document = models.ForeignKey(Document, on_delete=models.PROTECT, related_name="agreement_links")
+    agreement = models.ForeignKey(Agreement, on_delete=models.PROTECT, related_name="document_links")
+    relationship_role = models.CharField(
+        max_length=24, choices=RelationshipRole.choices, null=True, blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["document", "agreement"], name="unique_document_agreement_pair"),
+        ]
+
+    def __str__(self):
+        return f"{self.document} <-> {self.agreement}"
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
