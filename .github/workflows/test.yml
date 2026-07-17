@@ -97,8 +97,14 @@ jobs:
           psql -d test_sunset_ledger -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_runtime;"
           psql -d test_sunset_ledger -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_runtime;"
 
+      # NAME here is "sunset_ledger", not "test_sunset_ledger" -- pytest-django
+      # (via Django's test runner) derives its own test database name by
+      # prefixing NAME with "test_", so pointing this at the already-prefixed
+      # name would make it look for "test_test_sunset_ledger", which does not
+      # exist. "sunset_ledger" is the correct NAME to let Django compute
+      # "test_sunset_ledger" itself -- the exact database migrated above.
       - name: Test as app_runtime (reusing the migrator-owned schema)
         run: pytest --reuse-db
         env:
           DJANGO_SETTINGS_MODULE: config.settings.prod
-          DATABASE_URL: postgres://app_runtime:app_runtime@localhost:5432/test_sunset_ledger
+          DATABASE_URL: postgres://app_runtime:app_runtime@localhost:5432/sunset_ledger
