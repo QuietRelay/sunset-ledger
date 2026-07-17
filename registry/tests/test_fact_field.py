@@ -3,6 +3,7 @@ from django.core.exceptions import ValidationError
 
 from registry.models import FactField
 from registry.services import system_fields
+from registry.tests._db_helpers import is_postgres
 
 pytestmark = pytest.mark.django_db
 
@@ -91,11 +92,23 @@ def test_descriptive_field_must_not_set_machine_key():
         ).save()
 
 
+@pytest.mark.skipif(
+    is_postgres(),
+    reason="On Postgres, RLS -- not the Python guard -- is the authority for "
+           "whatever role this suite is connected as; see "
+           "test_fact_field_rls_postgres.py for the role-aware equivalent.",
+)
 def test_within_guard_context_machine_field_writes_are_allowed():
-    # Positive control: the same mechanism the seed migration relies on
-    # (allow_system_field_mutation) genuinely permits a machine-field
-    # write when used deliberately, rather than the guard being an
-    # unconditional block dressed up as a context manager.
+    # Positive control, SQLite only: application-level guard is the *only*
+    # enforcement layer on this backend, so allow_system_field_mutation()
+    # must genuinely permit a deliberate machine-field write here, exactly
+    # as the seed migration relies on -- otherwise the guard would just be
+    # an unconditional block dressed up as a context manager.
+    #
+    # This must NOT be assumed true on Postgres: there, a non-owning role
+    # (app_runtime) is blocked by row-level security regardless of this
+    # context manager, and the guard context permitting the *attempt*
+    # must never be read as the database permitting the *write*.
     field = FactField.objects.get(machine_key="end_date")
     with system_fields.allow_system_field_mutation():
         field.description = "updated inside a sanctioned migration context"

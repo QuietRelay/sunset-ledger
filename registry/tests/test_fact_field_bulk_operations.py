@@ -13,6 +13,7 @@ import pytest
 
 from registry.models import FactField
 from registry.services import system_fields
+from registry.tests._db_helpers import is_postgres
 
 pytestmark = pytest.mark.django_db
 
@@ -127,10 +128,18 @@ def test_bulk_update_of_ordinary_descriptive_rows_is_unaffected():
     assert field.description == "updated fine"
 
 
+@pytest.mark.skipif(
+    is_postgres(),
+    reason="On Postgres, RLS -- not the Python guard -- is the authority for "
+           "whatever role this suite is connected as; see "
+           "test_fact_field_rls_postgres.py for the role-aware equivalent.",
+)
 def test_all_four_bulk_paths_are_permitted_inside_the_guard_context():
-    # Positive control, mirroring the seed migration's own usage: the
-    # guard context genuinely permits these operations rather than being
-    # an unconditional block regardless of context.
+    # Positive control, SQLite only, mirroring the seed migration's own
+    # usage: the guard context genuinely permits these operations on the
+    # backend where it is the only enforcement layer, rather than being an
+    # unconditional block regardless of context. Must not be assumed true
+    # on Postgres as a non-owning role -- RLS is the real authority there.
     with system_fields.allow_system_field_mutation():
         field = FactField.objects.get(machine_key="end_date")
         field.description = "seed-migration-style edit"

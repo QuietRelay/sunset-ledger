@@ -273,6 +273,36 @@ so `app_runtime` is blocked on all four paths exactly as it is on
 with the same guard check. On SQLite, this QuerySet is the *only*
 protection those four paths have -- not defense in depth, load-bearing.
 
+**The Python guard context is not a universal override, and tests must
+never assume it is.** `allow_system_field_mutation()` only ever affects
+`registry`'s own application-level check -- it has no relationship to a
+Postgres session's role or RLS policies. Entering the context and then
+writing to a machine row as `app_runtime` still fails, exactly as it
+would outside the context, because RLS doesn't know the context manager
+exists. The context is genuinely authoritative *only* where there is no
+database-level backstop at all (SQLite, or a privileged role like
+`migrator` that owns the schema and isn't subject to the RLS policies in
+the first place). See `registry/tests/test_fact_field_rls_postgres.py`
+for the role-aware proof of this, including a dedicated integration test
+using a second connection authenticated as `migrator` to show its
+different privileges directly, rather than asserting it indirectly.
+
+One concrete consequence worth documenting precisely: on Postgres, a
+`save()` call that attempts to modify a machine row as `app_runtime`
+surfaces as `IntegrityError`, not a clean rejection. Django's
+`_save_table()` (`django/db/models/base.py`) tries an `UPDATE` first and
+only falls back to `INSERT` "if that doesn't update anything" (its own
+comment). RLS's `USING` clause makes a machine-category row invisible to
+`app_runtime`'s `UPDATE` policy, so the `UPDATE` matches zero rows
+*without erroring* -- Postgres does not distinguish "no such row" from
+"row exists but you can't see it" for a permissive `USING`-clause
+mismatch. Django reads the zero-row result as "this row doesn't exist
+yet" and attempts an `INSERT`, which then collides with the row's own,
+already-existing primary key. This was confirmed by reading Django's
+`_save_table` source directly, not inferred from the symptom alone -- it
+is a real Django/RLS interaction, not test isolation, fixture state, or
+object state, and it is not masked with `force_update`.
+
 ## Alert delivery lifecycle
 
 `alert_log` rows are never written as if delivery already succeeded.

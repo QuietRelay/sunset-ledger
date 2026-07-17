@@ -103,8 +103,17 @@ jobs:
       # name would make it look for "test_test_sunset_ledger", which does not
       # exist. "sunset_ledger" is the correct NAME to let Django compute
       # "test_sunset_ledger" itself -- the exact database migrated above.
+      # MIGRATOR_DATABASE_URL is read only by
+      # test_fact_field_rls_postgres.py's migrator-role integration test,
+      # which opens its own independent psycopg connection -- the ORM
+      # connection for this whole step is app_runtime, deliberately, so
+      # proving migrator's different privileges needs a separate
+      # connection, not the ORM's default one. Points directly at
+      # test_sunset_ledger (no Django test-name prefixing applies to a raw
+      # psycopg connection).
       - name: Test as app_runtime (reusing the migrator-owned schema)
         run: pytest --reuse-db
         env:
           DJANGO_SETTINGS_MODULE: config.settings.prod
           DATABASE_URL: postgres://app_runtime:app_runtime@localhost:5432/sunset_ledger
+          MIGRATOR_DATABASE_URL: postgres://migrator:migrator@localhost:5432/test_sunset_ledger
