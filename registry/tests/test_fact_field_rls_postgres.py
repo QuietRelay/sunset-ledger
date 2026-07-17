@@ -12,23 +12,34 @@ equivalent SQLite-only positive controls (the guard genuinely permitting
 a write when it's the only enforcement layer) live in test_fact_field.py
 and test_fact_field_bulk_operations.py.
 
-Two things confirmed against a real run, not assumed:
+Things confirmed against real runs, not assumed:
 
-1. Exception class. RLS rejections surface as `ProgrammingError` (a
-   `DatabaseError` subclass), not `IntegrityError` specifically -- assert
-   the broad `django.db.DatabaseError`, since the exact sub-mechanism
-   (an RLS policy violation vs. a downstream primary-key collision) can
-   legitimately differ per operation and per which values are involved,
-   and both are DatabaseError.
+1. Exception class. Where an operation does raise, it's `ProgrammingError`
+   (a `DatabaseError` subclass), not `IntegrityError` specifically --
+   assert the broad `django.db.DatabaseError`, since the exact
+   sub-mechanism (an RLS policy violation vs. a downstream primary-key
+   collision) can legitimately differ per operation and per which values
+   are involved, and both are DatabaseError.
 
 2. Transaction isolation. Postgres aborts the *entire* enclosing
    transaction after any error within it (unlike SQLite) -- without an
    inner savepoint, a test's own follow-up assertions (refresh_from_db(),
    a confirming SELECT) would themselves fail with "current transaction
-   is aborted" rather than actually verifying anything. Every deliberately
-   failing statement is therefore wrapped in its own transaction.atomic(),
-   which rolls back to a savepoint automatically when the exception
-   propagates out, leaving the outer test transaction usable again.
+   is aborted" rather than actually verifying anything. Every operation
+   confirmed to raise is wrapped in its own transaction.atomic(), which
+   rolls back to a savepoint automatically when the exception propagates
+   out, leaving the outer test transaction usable again.
+
+3. Not every rejected write raises at all. `Model.save()` and
+   `bulk_create()` do (see `_attempt_raises` below). `Model.delete()`,
+   `bulk_update()`, `QuerySet.update()`, and `QuerySet.delete()` do NOT --
+   confirmed by an actual failing run where three tests failed with
+   "DID NOT RAISE DatabaseError" precisely because RLS's USING clause
+   just filters the target row out of the statement entirely, leaving a
+   clean, non-erroring zero-row result with nothing to catch (see
+   `_attempt_noop` below). The dividing line is whether the operation has
+   anything resembling save()'s update-then-insert fallback to collide
+   with -- these four don't.
 
 Root-cause note on the INSERT-fallback behavior (still accurate, only the
 expected exception class was wrong): Django's Model._save_table()
@@ -61,8 +72,14 @@ pytestmark = [
 ]
 
 
-def _attempt(fn):
+def _attempt_raises(fn):
     """Run fn expecting a DatabaseError, inside its own savepoint.
+
+    Confirmed against a real run to apply to save() (via its
+    update-then-insert fallback colliding with RLS or the primary key)
+    and bulk_create() (a WITH CHECK violation on INSERT, evaluated
+    against the row being inserted, which Postgres rejects immediately
+    rather than silently).
 
     The savepoint (transaction.atomic() nested inside the test's own
     outer transaction) is not optional: Postgres aborts the whole
@@ -77,35 +94,47 @@ def _attempt(fn):
             fn()
 
 
+def _attempt_noop(fn):
+    """Run fn tolerating a DatabaseError, expecting none.
+
+    Confirmed against a real run: Model.delete(), bulk_update(),
+    QuerySet.update(), and QuerySet.delete() do NOT raise when their
+    target row is filtered out by RLS's USING clause -- the statement
+    executes, matches zero rows, and returns completely normally, no
+    exception, no aborted transaction. None of these have an equivalent
+    to save()'s update-then-insert fallback, so there is nothing for a
+    zero-row result to collide with. No savepoint is needed since nothing
+    raises; the `except` here is defensive, not the real assertion -- the
+    real proof is the unchanged-state check that follows this call.
+    """
+    try:
+        fn()
+    except DatabaseError:
+        pass
+
+
 class TestAppRuntimeCannotBypassRlsViaGuardContext:
     def test_save_cannot_modify_a_machine_row(self):
         field = FactField.objects.get(machine_key="end_date")
         original_description = field.description
         with system_fields.allow_system_field_mutation():
             field.description = "attempted change"
-            _attempt(field.save)
+            _attempt_raises(field.save)
         field.refresh_from_db()
         assert field.category == FactField.Category.MACHINE
         assert field.machine_key == "end_date"
         assert field.description == original_description
 
     def test_delete_cannot_remove_a_machine_row(self):
-        # Unlike the operations above, a DELETE whose target row is
-        # invisible under RLS's USING clause simply matches zero rows --
-        # a clean, non-erroring no-op, not a transaction-aborting error.
-        # No savepoint needed here; nothing raises.
         with system_fields.allow_system_field_mutation():
-            try:
-                FactField.objects.get(machine_key="end_date").delete()
-            except DatabaseError:
-                pass
+            _attempt_noop(FactField.objects.get(machine_key="end_date").delete)
         field = FactField.objects.get(machine_key="end_date")
         assert field.category == FactField.Category.MACHINE
         assert field.machine_key == "end_date"
 
     def test_bulk_create_cannot_introduce_a_machine_row(self):
         with system_fields.allow_system_field_mutation():
-            _attempt(lambda: FactField.objects.bulk_create([
+            _attempt_raises(lambda: FactField.objects.bulk_create([
                 FactField(
                     code="pg_bulk_created_machine", machine_key="pg_escape_attempt",
                     category=FactField.Category.MACHINE, value_type=FactField.ValueType.DATE,
@@ -118,7 +147,7 @@ class TestAppRuntimeCannotBypassRlsViaGuardContext:
         original_description = field.description
         with system_fields.allow_system_field_mutation():
             field.description = "attempted bulk_update change"
-            _attempt(lambda: FactField.objects.bulk_update([field], ["description"]))
+            _attempt_noop(lambda: FactField.objects.bulk_update([field], ["description"]))
         field.refresh_from_db()
         assert field.category == FactField.Category.MACHINE
         assert field.machine_key == "end_date"
@@ -127,7 +156,7 @@ class TestAppRuntimeCannotBypassRlsViaGuardContext:
     def test_queryset_update_cannot_modify_a_machine_row(self):
         original_description = FactField.objects.get(machine_key="end_date").description
         with system_fields.allow_system_field_mutation():
-            _attempt(lambda: FactField.objects.filter(machine_key="end_date").update(
+            _attempt_noop(lambda: FactField.objects.filter(machine_key="end_date").update(
                 description="attempted queryset update"
             ))
         field = FactField.objects.get(machine_key="end_date")
@@ -137,7 +166,7 @@ class TestAppRuntimeCannotBypassRlsViaGuardContext:
 
     def test_queryset_delete_cannot_remove_a_machine_row(self):
         with system_fields.allow_system_field_mutation():
-            _attempt(lambda: FactField.objects.filter(machine_key="end_date").delete())
+            _attempt_noop(lambda: FactField.objects.filter(machine_key="end_date").delete())
         field = FactField.objects.get(machine_key="end_date")
         assert field.category == FactField.Category.MACHINE
         assert field.machine_key == "end_date"
@@ -151,7 +180,7 @@ class TestAppRuntimeCannotBypassRlsViaGuardContext:
         with system_fields.allow_system_field_mutation():
             field.category = FactField.Category.DESCRIPTIVE
             field.machine_key = None
-            _attempt(field.save)
+            _attempt_raises(field.save)
         field.refresh_from_db()
         assert field.category == FactField.Category.MACHINE
         assert field.machine_key == "end_date"
@@ -189,7 +218,7 @@ class TestAppRuntimeCannotBypassRlsViaGuardContext:
             value_type=FactField.ValueType.TEXT,
         )
         with system_fields.allow_system_field_mutation():
-            _attempt(lambda: FactField.objects.filter(pk=descriptive.pk).update(
+            _attempt_raises(lambda: FactField.objects.filter(pk=descriptive.pk).update(
                 category=FactField.Category.MACHINE
             ))
         descriptive.refresh_from_db()
@@ -250,7 +279,7 @@ class TestMigratorRoleIntegration:
         # change, and even inside the Python guard context.
         with system_fields.allow_system_field_mutation():
             field.description = "attempted app_runtime edit after migrator's change"
-            _attempt(field.save)
+            _attempt_raises(field.save)
         field.refresh_from_db()
         assert field.category == FactField.Category.MACHINE
         assert field.machine_key == "start_date"

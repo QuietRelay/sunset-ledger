@@ -313,11 +313,18 @@ enclosing transaction after any error within it (unlike SQLite) -- a test
 that triggers an RLS rejection and then tries a follow-up assertion
 (`refresh_from_db()`, a confirming `SELECT`) on the same transaction will
 find *that* fails too, with "current transaction is aborted," masking the
-real result. Every deliberately-failing statement in
-`test_fact_field_rls_postgres.py` is wrapped in its own
-`transaction.atomic()` savepoint for exactly this reason -- it rolls back
-to the savepoint automatically once the exception propagates out, leaving
-the outer test transaction usable again for the assertions that follow.
+real result. Every statement in `test_fact_field_rls_postgres.py` that is
+confirmed to actually raise (`save()`, `bulk_create()`) is wrapped in its
+own `transaction.atomic()` savepoint for exactly this reason. Not every
+rejected write raises, though -- confirmed against a real run:
+`Model.delete()`, `bulk_update()`, `QuerySet.update()`, and
+`QuerySet.delete()` do not raise at all when RLS's `USING` clause filters
+their target row out; the statement completes normally with a clean
+zero-row result, and there is nothing for a savepoint to roll back. Those
+four are asserted with a tolerant helper and proven instead by checking
+that the row's state is unchanged afterward. The dividing line is whether
+the operation has anything resembling `save()`'s update-then-insert
+fallback to collide with -- these four don't.
 
 **Validation vs. RLS are two distinct, independently-tested layers.**
 Attempting to flip a descriptive row into a machine row through
