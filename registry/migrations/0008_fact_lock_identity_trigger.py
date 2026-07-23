@@ -37,6 +37,14 @@ _CHANGED_CHECK = " OR\n        ".join(
 # psycopg3's default extended query protocol does not support multiple
 # statements in a single execute(), which is what broke the first
 # version of both trigger migrations.
+#
+# The literal `%` in the RAISE EXCEPTION message (PL/pgSQL's own
+# placeholder syntax for OLD.id) must be escaped as `%%` here: Django's
+# schema_editor.execute() passes this string through psycopg's own
+# parameterized-query machinery even though no params are supplied, so an
+# unescaped `%` is read as an incomplete Python-style placeholder before
+# the SQL ever reaches Postgres (psycopg.ProgrammingError: incomplete
+# placeholder: '%'), not as a Postgres/PL/pgSQL syntax error.
 CREATE_FUNCTION_SQL = f"""
 CREATE OR REPLACE FUNCTION {FUNCTION_NAME}() RETURNS TRIGGER AS $$
 BEGIN
@@ -44,7 +52,7 @@ BEGIN
         {_CHANGED_CHECK}
     ) THEN
         RAISE EXCEPTION
-            'Fact % evidentiary identity cannot change once created (agreement, field, '
+            'Fact %% evidentiary identity cannot change once created (agreement, field, '
             'qualifier, typed value, scope_period, valid_from, primary_document, '
             'page_or_section_reference, excerpt, effective_date_basis, created_by) -- '
             'create a replacement fact via '

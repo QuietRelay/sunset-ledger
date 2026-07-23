@@ -31,6 +31,14 @@ TABLE = "registry_document"
 # pattern; combining CREATE FUNCTION and CREATE TRIGGER into one string
 # passed to a single execute() is what actually broke the first version
 # of this migration.
+#
+# The literal `%` in the RAISE EXCEPTION message (PL/pgSQL's own
+# placeholder syntax for OLD.id) must be escaped as `%%` here: Django's
+# schema_editor.execute() passes this string through psycopg's own
+# parameterized-query machinery even though no params are supplied, so an
+# unescaped `%` is read as an incomplete Python-style placeholder before
+# the SQL ever reaches Postgres (psycopg.ProgrammingError: incomplete
+# placeholder: '%'), not as a Postgres/PL/pgSQL syntax error.
 CREATE_FUNCTION_SQL = f"""
 CREATE OR REPLACE FUNCTION {FUNCTION_NAME}() RETURNS TRIGGER AS $$
 BEGIN
@@ -43,7 +51,7 @@ BEGIN
         IF EXISTS (SELECT 1 FROM registry_fact WHERE primary_document_id = OLD.id)
            OR EXISTS (SELECT 1 FROM registry_factcorroboration WHERE document_id = OLD.id) THEN
             RAISE EXCEPTION
-                'Document % is cited by a fact -- archived_storage_key/content_sha256/'
+                'Document %% is cited by a fact -- archived_storage_key/content_sha256/'
                 'file_size_bytes/mime_type cannot change. Create a new Document and link '
                 'it via DocumentRelationship(corrected_version_of) instead.', OLD.id;
         END IF;
