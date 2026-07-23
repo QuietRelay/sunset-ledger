@@ -55,6 +55,77 @@ def test_master_agreement_cannot_have_a_parent(jurisdiction, vendor):
         )
 
 
+def test_standalone_agreement_cannot_have_a_parent(jurisdiction, vendor):
+    master = Agreement.objects.create(
+        jurisdiction=jurisdiction, vendor=vendor,
+        agreement_type=Agreement.AgreementType.MASTER_AGREEMENT,
+    )
+    with pytest.raises(ValidationError):
+        Agreement.objects.create(
+            jurisdiction=jurisdiction, vendor=vendor,
+            agreement_type=Agreement.AgreementType.STANDALONE_AGREEMENT,
+            parent_agreement=master,
+        )
+
+
+def test_participating_agreement_requires_a_parent(jurisdiction, vendor):
+    with pytest.raises(ValidationError):
+        Agreement.objects.create(
+            jurisdiction=jurisdiction, vendor=vendor,
+            agreement_type=Agreement.AgreementType.PARTICIPATING_AGREEMENT,
+        )
+
+
+def test_participating_agreement_parent_must_be_a_master(jurisdiction, vendor):
+    standalone = Agreement.objects.create(
+        jurisdiction=jurisdiction, vendor=vendor,
+        agreement_type=Agreement.AgreementType.STANDALONE_AGREEMENT,
+    )
+    with pytest.raises(ValidationError):
+        Agreement.objects.create(
+            jurisdiction=jurisdiction, vendor=vendor,
+            agreement_type=Agreement.AgreementType.PARTICIPATING_AGREEMENT,
+            parent_agreement=standalone,
+        )
+
+
+def test_task_order_parent_is_optional_and_may_be_any_type(jurisdiction, vendor):
+    standalone = Agreement.objects.create(
+        jurisdiction=jurisdiction, vendor=vendor,
+        agreement_type=Agreement.AgreementType.STANDALONE_AGREEMENT,
+    )
+    task_order_without_parent = Agreement.objects.create(
+        jurisdiction=jurisdiction, vendor=vendor,
+        agreement_type=Agreement.AgreementType.TASK_ORDER,
+    )
+    task_order_under_standalone = Agreement.objects.create(
+        jurisdiction=jurisdiction, vendor=vendor,
+        agreement_type=Agreement.AgreementType.TASK_ORDER,
+        parent_agreement=standalone,
+    )
+    assert task_order_without_parent.parent_agreement is None
+    assert task_order_under_standalone.parent_agreement == standalone
+
+
+def test_hierarchy_cycle_several_links_deep_is_rejected(jurisdiction, vendor):
+    # A CheckConstraint alone only catches direct self-parenting; a cycle
+    # A -> B -> C -> A needs an actual traversal.
+    a = Agreement.objects.create(
+        jurisdiction=jurisdiction, vendor=vendor, agreement_type=Agreement.AgreementType.TASK_ORDER,
+    )
+    b = Agreement.objects.create(
+        jurisdiction=jurisdiction, vendor=vendor, agreement_type=Agreement.AgreementType.TASK_ORDER,
+        parent_agreement=a,
+    )
+    c = Agreement.objects.create(
+        jurisdiction=jurisdiction, vendor=vendor, agreement_type=Agreement.AgreementType.TASK_ORDER,
+        parent_agreement=b,
+    )
+    a.parent_agreement = c
+    with pytest.raises(ValidationError):
+        a.save()
+
+
 def test_agreement_cannot_be_its_own_parent(jurisdiction, vendor):
     agreement = Agreement.objects.create(
         jurisdiction=jurisdiction, vendor=vendor,

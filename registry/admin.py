@@ -6,11 +6,19 @@ from .models import (
     Document,
     DocumentAgreement,
     DocumentRelationship,
+    Fact,
+    FactCorroboration,
+    FactDispute,
+    FactDisputeMember,
     FactField,
+    FactFieldQualifier,
     Jurisdiction,
+    RequiredFactSet,
     Reviewer,
     Vendor,
     VendorAlias,
+    Verification,
+    VerificationFact,
 )
 
 
@@ -124,3 +132,78 @@ class DocumentAgreementAdmin(admin.ModelAdmin):
     list_display = ("document", "agreement", "relationship_role", "created_at")
     list_filter = ("relationship_role",)
     autocomplete_fields = ("document", "agreement")
+
+
+@admin.register(FactFieldQualifier)
+class FactFieldQualifierAdmin(admin.ModelAdmin):
+    list_display = ("field", "qualifier_key", "qualifier_description")
+    list_filter = ("field",)
+    search_fields = ("field__code", "qualifier_key")
+    autocomplete_fields = ("field",)
+
+
+class FactCorroborationInline(admin.TabularInline):
+    model = FactCorroboration
+    fk_name = "fact"
+    extra = 1
+    autocomplete_fields = ("document",)
+
+
+@admin.register(Fact)
+class FactAdmin(NeverDeletableAdminMixin, admin.ModelAdmin):
+    list_display = (
+        "__str__", "agreement", "field", "qualifier", "status",
+        "valid_from", "valid_until", "effective_date_basis",
+    )
+    list_filter = ("status", "field", "effective_date_basis")
+    search_fields = (
+        "agreement__jurisdiction__name", "agreement__vendor__canonical_name",
+        "field__code", "excerpt",
+    )
+    autocomplete_fields = ("agreement", "field", "qualifier", "primary_document", "supersedes", "retracted_by")
+    inlines = [FactCorroborationInline]
+
+    def get_readonly_fields(self, request, obj=None):
+        # A fact's core identity/value fields are conceptually immutable
+        # once recorded (corrections supersede, they don't edit in place)
+        # -- only the fields legitimately involved in a status transition
+        # (retraction) stay editable on an existing row.
+        if obj is None:
+            return []
+        editable = {"status", "retraction_reason", "retracted_by", "retracted_at"}
+        return [f.name for f in obj._meta.fields if f.name not in editable and f.name != "id"]
+
+
+class FactDisputeMemberInline(admin.TabularInline):
+    model = FactDisputeMember
+    extra = 1
+    autocomplete_fields = ("fact",)
+
+
+@admin.register(FactDispute)
+class FactDisputeAdmin(NeverDeletableAdminMixin, admin.ModelAdmin):
+    list_display = ("__str__", "status", "opened_by", "opened_at", "resolved_by", "resolved_at")
+    list_filter = ("status", "field")
+    autocomplete_fields = ("agreement", "field", "qualifier", "opened_by", "resolved_by")
+    inlines = [FactDisputeMemberInline]
+
+
+class VerificationFactInline(admin.TabularInline):
+    model = VerificationFact
+    extra = 1
+    autocomplete_fields = ("fact",)
+
+
+@admin.register(Verification)
+class VerificationAdmin(NeverDeletableAdminMixin, admin.ModelAdmin):
+    list_display = ("__str__", "agreement", "verified_by", "verified_at")
+    list_filter = ("verified_by",)
+    autocomplete_fields = ("agreement", "verified_by")
+    inlines = [VerificationFactInline]
+
+
+@admin.register(RequiredFactSet)
+class RequiredFactSetAdmin(admin.ModelAdmin):
+    list_display = ("purpose", "field", "required_when_field", "required_when_value")
+    list_filter = ("purpose",)
+    autocomplete_fields = ("field", "required_when_field")

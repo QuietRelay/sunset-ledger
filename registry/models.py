@@ -1,4 +1,5 @@
 import unicodedata
+from datetime import date
 
 from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
@@ -413,8 +414,41 @@ class Agreement(models.Model):
         return f"{self.jurisdiction} / {self.vendor} ({self.get_agreement_type_display()})"
 
     def clean(self):
-        if self.agreement_type == self.AgreementType.MASTER_AGREEMENT and self.parent_agreement_id:
-            raise ValidationError("A master_agreement cannot itself have a parent_agreement.")
+        # Parent policy by type: master and standalone agreements are
+        # never themselves a child; a participating agreement always
+        # participates *in* a master; a task order may optionally sit
+        # under anything (master, standalone, or another task order).
+        if self.agreement_type in (self.AgreementType.MASTER_AGREEMENT, self.AgreementType.STANDALONE_AGREEMENT):
+            if self.parent_agreement_id:
+                raise ValidationError(
+                    f"A {self.agreement_type} cannot itself have a parent_agreement."
+                )
+        elif self.agreement_type == self.AgreementType.PARTICIPATING_AGREEMENT:
+            if not self.parent_agreement_id:
+                raise ValidationError("A participating_agreement must have a parent_agreement.")
+            if self.parent_agreement.agreement_type != self.AgreementType.MASTER_AGREEMENT:
+                raise ValidationError(
+                    "A participating_agreement's parent_agreement must be a master_agreement."
+                )
+
+        if self.parent_agreement_id:
+            self._check_no_hierarchy_cycle()
+
+    def _check_no_hierarchy_cycle(self):
+        # CheckConstraint('agreement_parent_not_self') only catches
+        # direct self-parenting -- a cycle several links deep (A -> B ->
+        # C -> A) needs an actual traversal, since neither SQLite nor
+        # Postgres can express "no cycle in this self-referential FK" as
+        # a portable row-local CHECK constraint.
+        seen = {self.pk} if self.pk else set()
+        node = self.parent_agreement
+        depth = 0
+        while node is not None:
+            depth += 1
+            if node.pk in seen or depth > 100:
+                raise ValidationError("This parent_agreement chain forms a cycle.")
+            seen.add(node.pk)
+            node = node.parent_agreement
 
     def save(self, *args, **kwargs):
         self.full_clean()
@@ -482,19 +516,26 @@ class DocumentQuerySet(models.QuerySet):
 
 class Document(models.Model):
     """An archived artifact (contract, amendment, agenda packet, etc.).
-    Archived bytes at `archived_storage_key` are treated as immutable by
-    editorial convention -- corrections create a new Document linked via
-    DocumentRelationship(corrected_version_of), rather than editing this
-    row's content-identifying fields in place. That convention is not
-    enforced as a hard field lock in this slice (no requirement calls for
-    one, and admin-based data entry benefits from ordinary editability
-    before publication); `wayback_*` fields are explicitly expected to
-    change repeatedly via the future archive_sources retry command.
+
+    Before any fact cites this document, its core identity fields are
+    ordinarily editable -- admin-based data entry benefits from that
+    while a record is still being assembled. Once a fact cites it (as
+    `primary_document` or via `FactCorroboration`), `archived_storage_key`,
+    `content_sha256`, `file_size_bytes`, and `mime_type` become locked
+    (see `_LOCKED_ONCE_CITED_FIELDS` and `clean()` below): a document a
+    published fact points to must keep meaning the same archived bytes.
+    Corrections after that point create a new Document linked via
+    DocumentRelationship(corrected_version_of) instead of editing this row
+    in place. `wayback_*` fields are exempt -- they're expected to change
+    repeatedly via the future archive_sources retry command regardless of
+    citation state.
 
     `content_sha256` is intentionally NOT unique -- identical hashes are
     permitted and resolved editorially via DocumentRelationship(duplicate_of),
     never rejected at insert. See docs/schema-spec.md.
     """
+
+    _LOCKED_ONCE_CITED_FIELDS = ("archived_storage_key", "content_sha256", "file_size_bytes", "mime_type")
 
     class DocumentType(models.TextChoices):
         ORIGINAL_AGREEMENT = "original_agreement", "Original agreement"
@@ -602,6 +643,24 @@ class Document(models.Model):
                 "unredacted_retention_reason is required when "
                 "unredacted_copy_status='retained_restricted'."
             )
+        self._check_locked_fields_unchanged_if_cited()
+
+    def _is_cited_by_a_fact(self):
+        if not self.pk:
+            return False
+        return self.primary_facts.exists() or self.corroborated_facts.exists()
+
+    def _check_locked_fields_unchanged_if_cited(self):
+        if not self._is_cited_by_a_fact():
+            return
+        previous = type(self).objects.get(pk=self.pk)
+        for field_name in self._LOCKED_ONCE_CITED_FIELDS:
+            if getattr(self, field_name) != getattr(previous, field_name):
+                raise ValidationError(
+                    f"'{field_name}' cannot change: this document is cited by a fact. "
+                    "Create a new Document and link it via "
+                    "DocumentRelationship(corrected_version_of) instead."
+                )
 
     def save(self, *args, **kwargs):
         self.full_clean()
@@ -674,8 +733,13 @@ class DocumentAgreement(models.Model):
 
     This is NOT field-level provenance -- it only says "this document is
     associated with this agreement," nothing about which specific claims
-    it supports. Field-level citation is fact.primary_document_id, in the
-    future fact slice.
+    it supports. Field-level citation is fact.primary_document_id.
+
+    Known v1 limitation, accepted rather than expanded now: exactly one
+    row per (document, agreement) pair, so a document playing genuinely
+    multiple roles for the same agreement (e.g. both the governing
+    instrument and the pricing schedule) has to pick one role, not
+    record both. Revisit if that turns out to matter in practice.
     """
 
     class RelationshipRole(models.TextChoices):
@@ -699,6 +763,552 @@ class DocumentAgreement(models.Model):
 
     def __str__(self):
         return f"{self.document} <-> {self.agreement}"
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class FactFieldQualifier(models.Model):
+    """A controlled qualifier scoped to one specific FactField -- e.g.
+    'year_2' or 'option_b' only make sense for particular fields, not as
+    a global vocabulary. Ordinary admin-manageable reference data in v1,
+    same as descriptive FactField rows; not given the machine-field
+    RLS/guard treatment even when the parent field is category=machine,
+    since nothing yet reads a specific qualifier_key by hardcoded name
+    the way the deadline engine will read machine_key. Revisit if/when
+    it does.
+    """
+
+    field = models.ForeignKey(FactField, on_delete=models.PROTECT, related_name="qualifiers")
+    qualifier_key = models.SlugField(max_length=64)
+    qualifier_description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["field", "qualifier_key"], name="uniq_qualifier_per_field"),
+        ]
+        ordering = ["field", "qualifier_key"]
+
+    def __str__(self):
+        return f"{self.field.code}:{self.qualifier_key}"
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class FactQuerySet(models.QuerySet):
+    """See registry.services.integrity -- facts are never hard-deleted;
+    retract them instead."""
+
+    def delete(self):
+        raise integrity.RecordDeletionNotAllowed(
+            "Facts are never hard-deleted in v1 -- retract them instead. See docs/schema-spec.md."
+        )
+
+    def operative_at(self, agreement, field, as_of, qualifier=None):
+        """The fact whose validity interval covers `as_of` for
+        (agreement, field[, qualifier]) -- resolves "current value" by
+        valid_from/valid_until, not by status. Excludes disputed/
+        retracted/proposed_option facts. A query helper for temporal
+        resolution, not deadline arithmetic -- callers needing an actual
+        notice-deadline computation are the future deadlines engine, not
+        this method.
+        """
+        qs = self.filter(
+            agreement=agreement, field=field, qualifier=qualifier,
+            status=Fact.Status.ACTIVE, valid_from__lte=as_of,
+        ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gt=as_of))
+        return qs.order_by("-valid_from").first()
+
+
+class Fact(integrity.UndeletableModelMixin, models.Model):
+    """The atomic material term. Never overwritten -- a change creates a
+    new row with `supersedes` pointing at the one it replaces; the old
+    row's `valid_until` is set to the new row's `valid_from`, and it
+    keeps status='active' (supersession is a temporal concern, resolved
+    by valid_from/valid_until, not a status value -- a superseded fact is
+    still a true historical assertion, just not currently operative).
+
+    Exactly one of value_text/value_number/value_date/value_bool is
+    populated, matching field.value_type -- enforced both by a portable
+    CHECK constraint (the "exactly one" part) and by clean() (the
+    "matches field.value_type" part, which needs a join CHECK can't do
+    portably).
+    """
+
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        DISPUTED = "disputed", "Disputed"
+        RETRACTED = "retracted", "Retracted"
+        PROPOSED_OPTION = "proposed_option", "Proposed option"
+
+    class PeriodUnit(models.TextChoices):
+        CALENDAR_DAYS = "calendar_days", "Calendar days"
+        BUSINESS_DAYS = "business_days", "Business days"
+        MONTHS = "months", "Months"
+        YEARS = "years", "Years"
+
+    class EffectiveDateBasis(models.TextChoices):
+        STATED_IN_DOCUMENT = "stated_in_document", "Stated in document"
+        EXECUTION_DATE = "execution_date", "Execution date"
+        APPROVAL_DATE = "approval_date", "Approval date"
+        UNSPECIFIED_DEFAULTED = "unspecified_defaulted", "Unspecified (defaulted)"
+
+    class PricingBasis(models.TextChoices):
+        TOTAL_CONTRACT_VALUE = "total_contract_value", "Total contract value"
+        ANNUAL_RECURRING = "annual_recurring", "Annual recurring"
+        MONTHLY_RECURRING = "monthly_recurring", "Monthly recurring"
+        ONE_TIME = "one_time", "One time"
+
+    agreement = models.ForeignKey(Agreement, on_delete=models.PROTECT, related_name="facts")
+    field = models.ForeignKey(FactField, on_delete=models.PROTECT, related_name="facts")
+    qualifier = models.ForeignKey(
+        FactFieldQualifier, on_delete=models.PROTECT, null=True, blank=True, related_name="facts",
+    )
+    scope_period_start = models.DateField(null=True, blank=True)
+    scope_period_end = models.DateField(null=True, blank=True)
+
+    value_text = models.TextField(null=True, blank=True)
+    value_number = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    value_date = models.DateField(null=True, blank=True)
+    value_bool = models.BooleanField(null=True, blank=True)
+
+    period_unit = models.CharField(max_length=16, choices=PeriodUnit.choices, null=True, blank=True)
+    currency = models.CharField(max_length=3, null=True, blank=True, help_text="ISO 4217, e.g. USD.")
+    pricing_basis = models.CharField(max_length=24, choices=PricingBasis.choices, null=True, blank=True)
+
+    valid_from = models.DateField()
+    valid_until = models.DateField(null=True, blank=True)
+    recorded_at = models.DateTimeField(auto_now_add=True)
+
+    effective_date_basis = models.CharField(max_length=24, choices=EffectiveDateBasis.choices)
+
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
+    supersedes = models.ForeignKey(
+        "self", on_delete=models.PROTECT, null=True, blank=True, related_name="superseded_by",
+    )
+    retraction_reason = models.TextField(blank=True)
+    retracted_by = models.ForeignKey(
+        Reviewer, on_delete=models.PROTECT, null=True, blank=True, related_name="facts_retracted",
+    )
+    retracted_at = models.DateTimeField(null=True, blank=True)
+
+    primary_document = models.ForeignKey(Document, on_delete=models.PROTECT, related_name="primary_facts")
+    page_or_section_reference = models.CharField(max_length=255, blank=True)
+    excerpt = models.TextField(blank=True)
+
+    objects = FactQuerySet.as_manager()
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    (models.Q(value_text__isnull=False) & models.Q(value_number__isnull=True)
+                     & models.Q(value_date__isnull=True) & models.Q(value_bool__isnull=True))
+                    | (models.Q(value_text__isnull=True) & models.Q(value_number__isnull=False)
+                       & models.Q(value_date__isnull=True) & models.Q(value_bool__isnull=True))
+                    | (models.Q(value_text__isnull=True) & models.Q(value_number__isnull=True)
+                       & models.Q(value_date__isnull=False) & models.Q(value_bool__isnull=True))
+                    | (models.Q(value_text__isnull=True) & models.Q(value_number__isnull=True)
+                       & models.Q(value_date__isnull=True) & models.Q(value_bool__isnull=False))
+                ),
+                name="fact_value_exactly_one",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(valid_until__isnull=True) | models.Q(valid_until__gt=models.F("valid_from")),
+                name="fact_valid_until_after_from",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(scope_period_start__isnull=True) | models.Q(scope_period_end__isnull=True)
+                    | models.Q(scope_period_end__gte=models.F("scope_period_start"))
+                ),
+                name="fact_scope_period_order",
+            ),
+            # Split in two, like RequiredFactSet's rule constraint: standard
+            # SQL treats NULL as never equal to NULL, so a single combined
+            # UniqueConstraint would silently fail to dedupe the common
+            # case (no qualifier, no scope period -- true of every
+            # machine field today) since qualifier/scope_period_start/
+            # scope_period_end are all nullable. Splitting on whether
+            # qualifier is set covers that case and the qualifier-
+            # differentiated-concurrency case correctly; a fact with
+            # qualifier=NULL but only one of scope_period_start/end set is
+            # a narrow, documented residual gap, not expected in practice
+            # since every allows_multiple_concurrent field in this schema
+            # differentiates by qualifier.
+            models.UniqueConstraint(
+                fields=["agreement", "field", "valid_from"],
+                condition=models.Q(
+                    status="active", qualifier__isnull=True,
+                    scope_period_start__isnull=True, scope_period_end__isnull=True,
+                ),
+                name="uniq_active_fact_bare",
+            ),
+            models.UniqueConstraint(
+                fields=["agreement", "field", "qualifier", "scope_period_start", "scope_period_end", "valid_from"],
+                condition=models.Q(status="active", qualifier__isnull=False),
+                name="uniq_active_fact_qualified",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["agreement", "field"], name="fact_agreement_field_idx"),
+            models.Index(fields=["valid_from", "valid_until"], name="fact_validity_idx"),
+            models.Index(fields=["status"], name="fact_status_idx"),
+        ]
+        ordering = ["agreement", "field", "-valid_from"]
+
+    def __str__(self):
+        return f"{self.agreement} / {self.field.code} (valid_from={self.valid_from})"
+
+    def clean(self):
+        self._check_exactly_one_value_matches_type()
+        self._check_qualifier_belongs_to_field()
+        self._check_effective_date_basis_against_document_dates()
+        self._check_retraction_reason_required()
+        self._check_no_illegitimate_concurrency()
+        self._check_supersession_target_consistency()
+
+    def _check_exactly_one_value_matches_type(self):
+        values = dict(
+            text=self.value_text, number=self.value_number, date=self.value_date, bool=self.value_bool,
+        )
+        populated = [name for name, value in values.items() if value is not None]
+        if len(populated) != 1:
+            raise ValidationError(
+                "Exactly one of value_text/value_number/value_date/value_bool must be set."
+            )
+        expected = {
+            FactField.ValueType.TEXT: "text", FactField.ValueType.DATE: "date",
+            FactField.ValueType.NUMBER: "number", FactField.ValueType.BOOL: "bool",
+        }[self.field.value_type]
+        if populated[0] != expected:
+            raise ValidationError(
+                f"field.value_type='{self.field.value_type}' requires value_{expected} to be set, "
+                f"not value_{populated[0]}."
+            )
+
+    def _check_qualifier_belongs_to_field(self):
+        if self.qualifier_id and self.qualifier.field_id != self.field_id:
+            raise ValidationError("qualifier must belong to this fact's own field.")
+
+    def _check_effective_date_basis_against_document_dates(self):
+        comparison_date = self.primary_document.execution_date or self.primary_document.vote_or_approval_date
+        if (
+            comparison_date
+            and self.valid_from < comparison_date
+            and self.effective_date_basis != self.EffectiveDateBasis.STATED_IN_DOCUMENT
+        ):
+            raise ValidationError(
+                "valid_from may only precede the primary document's execution/approval date "
+                "when effective_date_basis='stated_in_document'."
+            )
+
+    def _check_retraction_reason_required(self):
+        if self.status == self.Status.RETRACTED and not self.retraction_reason:
+            raise ValidationError("retraction_reason is required when status='retracted'.")
+
+    def _check_no_illegitimate_concurrency(self):
+        if self.field.allows_multiple_concurrent or self.status != self.Status.ACTIVE:
+            return
+        others = Fact.objects.filter(agreement=self.agreement, field=self.field, status=self.Status.ACTIVE)
+        if self.pk:
+            others = others.exclude(pk=self.pk)
+        this_end = self.valid_until  # None == open-ended
+        for other in others:
+            other_end = other.valid_until
+            if other.pk == self.supersedes_id:
+                # This fact is about to close out `other`'s window as
+                # part of supersession (_close_out_superseded_fact runs
+                # after save()) -- treat it as already closed here, or a
+                # legitimate supersession would look like an illegitimate
+                # overlap purely because of save() ordering.
+                other_end = self.valid_from
+            overlaps = self.valid_from < (other_end or date.max) and other.valid_from < (this_end or date.max)
+            if overlaps:
+                raise ValidationError(
+                    f"'{self.field.code}' does not allow concurrent active facts, and this "
+                    f"fact's validity window overlaps an existing one (id={other.pk})."
+                )
+
+    def _check_supersession_target_consistency(self):
+        # Validated pre-save so a conflicting chain is rejected before
+        # this fact is ever written, rather than discovered only after
+        # (and left half-applied) by the post-save close-out step.
+        if self.supersedes_id and self.supersedes.valid_until is not None:
+            if self.supersedes.valid_until != self.valid_from:
+                raise ValidationError(
+                    "supersedes target already has a different valid_until set -- "
+                    "resolve the conflicting chain manually before superseding it."
+                )
+
+    def _close_out_superseded_fact(self):
+        if not self.supersedes_id:
+            return
+        old = self.supersedes
+        if old.valid_until is None:
+            old.valid_until = self.valid_from
+            old.save()
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        is_new = self._state.adding
+        super().save(*args, **kwargs)
+        if is_new:
+            self._close_out_superseded_fact()
+
+
+class FactCorroboration(models.Model):
+    """A document that independently corroborates a fact, distinct from
+    the fact's single `primary_document`. Additive, not a replacement --
+    a fact's primary source is one document with a page/section
+    reference; corroboration is optional, additional support."""
+
+    fact = models.ForeignKey(Fact, on_delete=models.PROTECT, related_name="corroborations")
+    document = models.ForeignKey(Document, on_delete=models.PROTECT, related_name="corroborated_facts")
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["fact", "document"], name="uniq_fact_corroboration"),
+        ]
+
+    def __str__(self):
+        return f"{self.document} corroborates {self.fact}"
+
+    def clean(self):
+        if self.document_id and self.fact_id and self.document_id == self.fact.primary_document_id:
+            raise ValidationError(
+                "A document already cited as this fact's primary_document is redundant as corroboration."
+            )
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class FactDispute(integrity.UndeletableModelMixin, models.Model):
+    """An explicitly opened disagreement over a specific (agreement,
+    field[, qualifier]) -- created deliberately by a reviewer who has
+    noticed two documents genuinely contradict each other, not inferred
+    automatically from multiple active facts existing (qualifiers and
+    scope periods make multiplicity normal; a dispute is for the
+    non-normal case). Never hard-deleted -- a dispute and how it was
+    resolved is itself part of the audit trail."""
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        RESOLVED_FAVORS_ONE = "resolved_favors_one", "Resolved (favors one)"
+        RESOLVED_BOTH_PARTIALLY_CORRECT = "resolved_both_partially_correct", "Resolved (both partially correct)"
+        RESOLVED_UNRESOLVED = "resolved_unresolved", "Resolved (left unresolved)"
+
+    agreement = models.ForeignKey(Agreement, on_delete=models.PROTECT, related_name="fact_disputes")
+    field = models.ForeignKey(FactField, on_delete=models.PROTECT, related_name="disputes")
+    qualifier = models.ForeignKey(
+        FactFieldQualifier, on_delete=models.PROTECT, null=True, blank=True, related_name="disputes",
+    )
+    status = models.CharField(max_length=32, choices=Status.choices, default=Status.OPEN)
+    opened_at = models.DateTimeField(auto_now_add=True)
+    opened_by = models.ForeignKey(Reviewer, on_delete=models.PROTECT, related_name="disputes_opened")
+    resolution_note = models.TextField(blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    resolved_by = models.ForeignKey(
+        Reviewer, on_delete=models.PROTECT, null=True, blank=True, related_name="disputes_resolved",
+    )
+
+    objects = integrity.UndeletableQuerySet.as_manager()
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["agreement", "field"], name="fact_dispute_agree_field_idx"),
+        ]
+
+    def __str__(self):
+        return f"Dispute: {self.agreement} / {self.field.code} ({self.status})"
+
+    def clean(self):
+        if self.status != self.Status.OPEN and not self.resolution_note:
+            raise ValidationError("resolution_note is required once a dispute leaves 'open' status.")
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        previous_status = None
+        if self.pk:
+            previous_status = type(self).objects.only("status").get(pk=self.pk).status
+        super().save(*args, **kwargs)
+        if previous_status == self.Status.OPEN and self.status != self.Status.OPEN:
+            self._apply_resolution_to_member_facts()
+
+    def _apply_resolution_to_member_facts(self):
+        # Verification rows on any of these facts are never touched here
+        # -- they remain a permanent record of what was checked and when,
+        # independent of this dispute's outcome.
+        for member in self.members.select_related("fact"):
+            if member.outcome == FactDisputeMember.Outcome.UPHELD:
+                member.fact.status = Fact.Status.ACTIVE
+                member.fact.save()
+            # REJECTED (or still UNDER_REVIEW at resolution time) stays
+            # disputed permanently -- the dispute's own resolution_note
+            # is that fact's lasting justification.
+
+
+class FactDisputeMember(integrity.UndeletableModelMixin, models.Model):
+    """One fact caught up in a dispute. Linking a fact here while its
+    dispute is open puts that fact into status='disputed' -- excluding
+    it from the active-uniqueness constraint and from ever being read as
+    the current value until the dispute resolves."""
+
+    class Outcome(models.TextChoices):
+        UNDER_REVIEW = "under_review", "Under review"
+        UPHELD = "upheld", "Upheld"
+        REJECTED = "rejected", "Rejected"
+
+    dispute = models.ForeignKey(FactDispute, on_delete=models.PROTECT, related_name="members")
+    fact = models.ForeignKey(Fact, on_delete=models.PROTECT, related_name="dispute_memberships")
+    position_note = models.TextField(blank=True)
+    outcome = models.CharField(max_length=16, choices=Outcome.choices, default=Outcome.UNDER_REVIEW)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = integrity.UndeletableQuerySet.as_manager()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["dispute", "fact"], name="uniq_dispute_member"),
+        ]
+
+    def __str__(self):
+        return f"{self.fact} in {self.dispute}"
+
+    def clean(self):
+        if self.fact_id and self.dispute_id and self.fact.agreement_id != self.dispute.agreement_id:
+            raise ValidationError("A dispute's member facts must belong to the dispute's own agreement.")
+        if self.fact_id and self.dispute_id and self.fact.field_id != self.dispute.field_id:
+            raise ValidationError("A dispute's member facts must belong to the dispute's own field.")
+        if self.fact_id and self.dispute_id and self.fact.qualifier_id != self.dispute.qualifier_id:
+            raise ValidationError("A dispute's member facts must match the dispute's own qualifier.")
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+        if self.dispute.status == FactDispute.Status.OPEN and self.fact.status != Fact.Status.DISPUTED:
+            self.fact.status = Fact.Status.DISPUTED
+            self.fact.save()
+
+
+class Verification(integrity.UndeletableModelMixin, models.Model):
+    """A review event covering a specific set of facts as of a point in
+    time -- never the agreement as a whole. Permanent: a verification
+    record is never invalidated by a later dispute or supersession on the
+    facts it covered, only superseded in *relevance* (see
+    VerificationFact / docs/schema-spec.md's tier-derivation rules,
+    implemented in the future deadline/tier slice, not here)."""
+
+    agreement = models.ForeignKey(Agreement, on_delete=models.PROTECT, related_name="verifications")
+    verified_by = models.ForeignKey(Reviewer, on_delete=models.PROTECT, related_name="verifications_performed")
+    verified_at = models.DateTimeField(auto_now_add=True)
+    what_was_checked = models.TextField(blank=True)
+
+    objects = integrity.UndeletableQuerySet.as_manager()
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["agreement"], name="verification_agreement_idx"),
+        ]
+
+    def __str__(self):
+        return f"Verification of {self.agreement} by {self.verified_by} at {self.verified_at}"
+
+
+class VerificationFact(integrity.UndeletableModelMixin, models.Model):
+    """Which exact fact rows a verification covers. A verification's
+    facts must all belong to the verification's own agreement --
+    enforced in clean() so a reviewer cannot accidentally attach a fact
+    from an unrelated agreement to this verification event. There is no
+    portable database constraint for this (it requires joining through
+    fact to agreement, which a row-local CHECK cannot express), so this
+    is application-level validation only -- documented, not silently
+    assumed equivalent to a DB guarantee."""
+
+    verification = models.ForeignKey(Verification, on_delete=models.PROTECT, related_name="covered_facts")
+    fact = models.ForeignKey(Fact, on_delete=models.PROTECT, related_name="verification_links")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = integrity.UndeletableQuerySet.as_manager()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["verification", "fact"], name="uniq_verification_fact"),
+        ]
+
+    def __str__(self):
+        return f"{self.fact} verified by {self.verification.verified_by}"
+
+    def clean(self):
+        if self.fact_id and self.verification_id and self.fact.agreement_id != self.verification.agreement_id:
+            raise ValidationError(
+                "A verification cannot cover a fact from a different agreement than the "
+                "verification's own agreement."
+            )
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class RequiredFactSet(models.Model):
+    """Declarative membership in a required-fact set, used by the future
+    deadline/tier engine to compute deadline_confidence and
+    record_completeness -- not implemented here, only the data these
+    computations will read. `required_when_*` makes a requirement
+    conditional (e.g. a notice-period field is only required when
+    renewal_mechanism equals a specific value)."""
+
+    class Purpose(models.TextChoices):
+        DEADLINE_CONFIDENCE = "deadline_confidence", "Deadline confidence"
+        RECORD_COMPLETENESS = "record_completeness", "Record completeness"
+
+    purpose = models.CharField(max_length=24, choices=Purpose.choices)
+    field = models.ForeignKey(FactField, on_delete=models.PROTECT, related_name="required_in_sets")
+    required_when_field = models.ForeignKey(
+        FactField, on_delete=models.PROTECT, null=True, blank=True, related_name="+",
+    )
+    required_when_value = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # A single UniqueConstraint across all four fields would not
+            # actually dedupe unconditional rules: standard SQL treats
+            # NULL as never equal to NULL, so two rows both having
+            # required_when_field=NULL would not collide under one
+            # combined constraint. Split into two partial constraints so
+            # each case is deduped on the fields that are actually
+            # meaningful for it.
+            models.UniqueConstraint(
+                fields=["purpose", "field"],
+                condition=models.Q(required_when_field__isnull=True),
+                name="uniq_required_fact_set_unconditional",
+            ),
+            models.UniqueConstraint(
+                fields=["purpose", "field", "required_when_field", "required_when_value"],
+                condition=models.Q(required_when_field__isnull=False),
+                name="uniq_required_fact_set_conditional",
+            ),
+        ]
+
+    def __str__(self):
+        condition = f" when {self.required_when_field.code}={self.required_when_value}" if self.required_when_field_id else ""
+        return f"{self.purpose}: {self.field.code}{condition}"
+
+    def clean(self):
+        if bool(self.required_when_field_id) != bool(self.required_when_value):
+            raise ValidationError(
+                "required_when_field and required_when_value must be set together, or not at all."
+            )
 
     def save(self, *args, **kwargs):
         self.full_clean()

@@ -462,6 +462,85 @@ computation), `submission`, `subscription`, `alert_log`,
   the database constraint itself is real, independent of the
   application-level check duplicating it.
 
+## Implementation notes: fact/verification slice
+
+Implemented: `fact_field_qualifier`, `fact`, `fact_corroboration`,
+`fact_dispute`, `fact_dispute_member`, `verification`, `verification_fact`,
+`required_fact_set`. Not yet implemented: deadline computation, action
+opportunities, public pages, submissions, subscriptions, alerts, exports.
+
+- **Supersession is temporal, not a status value.** A superseding fact's
+  `save()` sets the fact it replaces' `valid_until` to its own
+  `valid_from` (validated pre-save against a conflicting existing
+  `valid_until`, so a bad chain is rejected before anything is written,
+  not discovered half-applied afterward); the superseded fact keeps
+  `status=active` throughout, since it's still a true historical
+  assertion, just not currently operative. "Current value" is resolved
+  by `Fact.objects.operative_at(agreement, field, as_of, qualifier=None)`
+  -- a temporal query helper, not deadline arithmetic.
+- **NULL is never equal to NULL in a UniqueConstraint** -- a real gap this
+  slice's own test suite caught in two places (`required_fact_set` and
+  `fact`), both fixed the same way: split one constraint spanning
+  nullable columns into partial constraints keyed on whether those
+  columns are null, rather than relying on the combined tuple to dedupe
+  rows where the nullable part is NULL in both. `fact`'s split still
+  leaves one narrow, accepted gap: a fact with `qualifier=NULL` but only
+  one of `scope_period_start`/`scope_period_end` set isn't deduped at the
+  database level -- not expected in practice, since every
+  `allows_multiple_concurrent` field in this schema differentiates
+  concurrent facts by qualifier, not scope period alone.
+- **Illegitimate concurrency is checked by temporal overlap, not mere
+  co-existence.** A field with `allows_multiple_concurrent=False`
+  rejects a new active fact only if its validity window actually
+  overlaps another active fact's window for the same (agreement,
+  field) -- a non-overlapping supersession chain is not concurrency.
+  The overlap check treats the fact being superseded as already closed
+  (its `valid_until` set to the new fact's `valid_from`) even though
+  that update hasn't executed yet, since the check runs pre-save and the
+  actual close-out is a post-save step -- otherwise every legitimate
+  supersession would look like an illegitimate overlap purely from
+  save() ordering.
+- **Cross-table consistency (qualifier belongs to its fact's field,
+  verification/dispute membership matches its own agreement) is
+  application-level (`clean()`) only, not a database constraint** -- a
+  portable, row-local CHECK constraint cannot join to another table in
+  either SQLite or Postgres. Documented as a real limitation, not
+  silently assumed equivalent to a DB guarantee, and each such rule has
+  a test proving the *application* layer catches it (there is nothing
+  else to prove at the database level for these specific rules).
+- **Dispute resolution is a status-sync side effect, not an admin
+  workflow/action** -- linking a fact to an open dispute
+  (`FactDisputeMember`) flips that fact to `status=disputed`; resolving
+  the dispute (`FactDispute.status` leaving `open`) reactivates each
+  member whose own `outcome=upheld` and leaves `rejected` members
+  disputed permanently. No admin action/button implements this as a
+  guided workflow yet -- it's implemented as the correct model-level
+  behavior a future workflow can call.
+- **Document immutability once cited** (carried forward from the
+  agreement/document slice): `archived_storage_key`, `content_sha256`,
+  `file_size_bytes`, `mime_type` lock the moment any `Fact.primary_document`
+  or `FactCorroboration.document` cites the row -- checked in
+  `Document.clean()` against the row's actual current DB values, not
+  merely against what was loaded into memory.
+- **Agreement hierarchy** (carried forward): parent-type policy is now
+  enforced (`master`/`standalone` never have a parent; `participating`
+  requires one and it must be a `master`; `task_order`'s parent is
+  optional and unrestricted in type), and a `clean()`-level traversal
+  rejects cycles several links deep -- the `CheckConstraint` preventing
+  direct self-parenting was never sufficient for that on its own.
+- **`DocumentAgreement`'s one-role-per-pair limitation** (carried
+  forward) is recorded as an accepted v1 simplification in the model's
+  own docstring, not expanded in this slice.
+- **Deletion, looking ahead to submissions**: the current blanket
+  never-delete rule on `Agreement`/`Document`/`Fact`/`FactDispute`/
+  `FactDisputeMember`/`Verification`/`VerificationFact` is a v1
+  simplification too. Once `submission`/moderation exists, an
+  unpromoted draft claim will need to be genuinely deletable (a
+  submitter's typo, a spam submission) in a way a *published* or
+  *cited* fact must not be -- that distinction doesn't exist yet because
+  `submission` doesn't exist yet, and is deferred rather than
+  approximated now.
+
 ## Milestones
 
 - **Milestone 1 (technical deployment):** full schema, deadline engine
