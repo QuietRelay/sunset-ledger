@@ -33,7 +33,11 @@ _CHANGED_CHECK = " OR\n        ".join(
     f"NEW.{col} IS DISTINCT FROM OLD.{col}" for col in IDENTITY_COLUMNS
 )
 
-CREATE_SQL = f"""
+# One statement per schema_editor.execute() call -- see 0007's comment:
+# psycopg3's default extended query protocol does not support multiple
+# statements in a single execute(), which is what broke the first
+# version of both trigger migrations.
+CREATE_FUNCTION_SQL = f"""
 CREATE OR REPLACE FUNCTION {FUNCTION_NAME}() RETURNS TRIGGER AS $$
 BEGIN
     IF (
@@ -49,29 +53,31 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+"""
 
+CREATE_TRIGGER_SQL = f"""
 CREATE TRIGGER {TRIGGER_NAME}
 BEFORE UPDATE ON {TABLE}
 FOR EACH ROW
 EXECUTE FUNCTION {FUNCTION_NAME}();
 """
 
-DROP_SQL = f"""
-DROP TRIGGER IF EXISTS {TRIGGER_NAME} ON {TABLE};
-DROP FUNCTION IF EXISTS {FUNCTION_NAME}();
-"""
+DROP_TRIGGER_SQL = f"DROP TRIGGER IF EXISTS {TRIGGER_NAME} ON {TABLE};"
+DROP_FUNCTION_SQL = f"DROP FUNCTION IF EXISTS {FUNCTION_NAME}();"
 
 
 def create_trigger(apps, schema_editor):
     if schema_editor.connection.vendor != "postgresql":
         return
-    schema_editor.execute(CREATE_SQL)
+    schema_editor.execute(CREATE_FUNCTION_SQL)
+    schema_editor.execute(CREATE_TRIGGER_SQL)
 
 
 def drop_trigger(apps, schema_editor):
     if schema_editor.connection.vendor != "postgresql":
         return
-    schema_editor.execute(DROP_SQL)
+    schema_editor.execute(DROP_TRIGGER_SQL)
+    schema_editor.execute(DROP_FUNCTION_SQL)
 
 
 class Migration(migrations.Migration):
