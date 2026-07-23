@@ -615,6 +615,54 @@ enforce what was already decided.
   every managed Postgres provider grants by default and is worth
   confirming availability for ahead of time.
 
+## Implementation notes: deadline computation slice
+
+Implemented: `registry/services/deadlines.py`'s
+`compute_action_opportunities(agreement, as_of)` and
+`select_primary_opportunity(opportunities)` -- a pure, read-only domain
+service. No public pages, forms, submissions, subscriptions, email
+alerts, exports, agenda scraping, or background jobs.
+
+- **The interface superseded the original scaffold stub's shape.** The
+  scaffold (commit-one placeholder) packed multiple date concepts
+  (`next_documented_public_event`, `recommended_agenda_monitoring_start`)
+  onto one object with an `is_primary` flag the computation itself set.
+  The frozen v1 interface instead returns a **list** of independent
+  `ActionOpportunity` entries, each with one `action_date` plus
+  `is_documented_event`/`is_advisory` flags, and selection is a fully
+  separate function that never mutates or is called by computation.
+- **Every input fact is resolved through one helper**
+  (`_resolve_operative_fact`), which is the single place
+  disputed/unspecified-basis exclusion happens: `Fact.objects.operative_at`
+  already excludes non-active facts; a resolved fact with
+  `effective_date_basis=unspecified_defaulted` is additionally excluded
+  as a hard stop, not a fallback search through history; and if nothing
+  resolves, a *disputed* candidate is looked for separately so
+  `blocking_dispute_id` can be populated, distinguishing "blocked by a
+  live dispute" from "never entered."
+- **Confidence and alert eligibility are deliberately separate axes.**
+  Confidence reflects arithmetic precision only. Eligibility for a
+  *resolved* calculated deadline or scheduled vote is unconditionally
+  true once resolved, because resolving at all already required every
+  input fact to individually clear the Tier-2 bar (disputed/unspecified-
+  basis facts can't be used as inputs in the first place) -- there is
+  nothing further to gate. Eligibility for an *unresolved* opportunity
+  instead asks whether the agreement has any document-backed fact at
+  all, matching the frozen `deadline_unavailable_notice` alert's
+  original gating.
+- **A caught bug worth recording**: the first draft of
+  `_notice_based_opportunity` checked the notice-days fact before
+  `end_date`, so when *both* were missing it reported the notice field
+  as the blocker instead of the more fundamental `end_date`. Fixed by
+  checking `end_date` first unconditionally, regardless of which fact a
+  given code path happens to look at first.
+- **No Postgres-specific tests were added for this slice** -- the module
+  is pure ORM reads (ordinary `Q`-object filters, nothing RLS- or
+  trigger-dependent) and Python-side arithmetic; SQLite/Postgres parity
+  is exercised by the existing CI matrix running the whole suite on both
+  backends, the same as every other non-integrity-specific test in this
+  project.
+
 ## Milestones
 
 - **Milestone 1 (technical deployment):** full schema, deadline engine
