@@ -160,7 +160,10 @@ class FactAdmin(NeverDeletableAdminMixin, admin.ModelAdmin):
         "agreement__jurisdiction__name", "agreement__vendor__canonical_name",
         "field__code", "excerpt",
     )
-    autocomplete_fields = ("agreement", "field", "qualifier", "primary_document", "supersedes", "retracted_by")
+    autocomplete_fields = (
+        "agreement", "field", "qualifier", "primary_document", "supersedes",
+        "created_by", "retracted_by",
+    )
     inlines = [FactCorroborationInline]
 
     def get_readonly_fields(self, request, obj=None):

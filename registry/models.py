@@ -506,12 +506,50 @@ class AgreementRelationship(models.Model):
 
 class DocumentQuerySet(models.QuerySet):
     """See registry.services.integrity -- documents are never
-    hard-deleted in v1, on either the instance or the bulk path."""
+    hard-deleted in v1, on either the instance or the bulk path.
+
+    update()/bulk_update() also guard Document.LOCKED_ONCE_CITED_FIELDS
+    the same way FactField's bulk operations guard machine fields --
+    Document.clean() only runs on the ordinary save() path, so
+    QuerySet.update() and bulk_update() would otherwise bypass the
+    cited-document lock entirely. Unlike the clean()-based check (which
+    only raises when the value actually differs from what's stored),
+    these bulk guards block any attempt to touch a locked field on a
+    cited document unconditionally, whether or not the new value would
+    match the old one -- bulk operations have no legitimate reason to
+    touch these fields on a cited row at all, so there is no reason to
+    tolerate an idempotent one either.
+    """
 
     def delete(self):
         raise integrity.RecordDeletionNotAllowed(
             "Documents are never hard-deleted in v1 -- see docs/schema-spec.md."
         )
+
+    def _cited(self):
+        return self.filter(
+            models.Q(primary_facts__isnull=False) | models.Q(corroborated_facts__isnull=False)
+        ).distinct()
+
+    def update(self, **kwargs):
+        touches_locked = any(f in kwargs for f in Document.LOCKED_ONCE_CITED_FIELDS)
+        if touches_locked and self._cited().exists():
+            raise integrity.LockedFieldMutationNotAllowed(
+                "QuerySet.update() cannot change archived_storage_key/content_sha256/"
+                "file_size_bytes/mime_type on a document already cited by a fact."
+            )
+        return super().update(**kwargs)
+
+    def bulk_update(self, objs, fields, **kwargs):
+        if any(f in fields for f in Document.LOCKED_ONCE_CITED_FIELDS):
+            objs = list(objs)
+            pks = [o.pk for o in objs if o.pk is not None]
+            if pks and Document.objects.filter(pk__in=pks)._cited().exists():
+                raise integrity.LockedFieldMutationNotAllowed(
+                    "bulk_update() cannot change archived_storage_key/content_sha256/"
+                    "file_size_bytes/mime_type on a document already cited by a fact."
+                )
+        return super().bulk_update(objs, fields, **kwargs)
 
 
 class Document(models.Model):
@@ -522,7 +560,7 @@ class Document(models.Model):
     while a record is still being assembled. Once a fact cites it (as
     `primary_document` or via `FactCorroboration`), `archived_storage_key`,
     `content_sha256`, `file_size_bytes`, and `mime_type` become locked
-    (see `_LOCKED_ONCE_CITED_FIELDS` and `clean()` below): a document a
+    (see `LOCKED_ONCE_CITED_FIELDS` and `clean()` below): a document a
     published fact points to must keep meaning the same archived bytes.
     Corrections after that point create a new Document linked via
     DocumentRelationship(corrected_version_of) instead of editing this row
@@ -535,7 +573,7 @@ class Document(models.Model):
     never rejected at insert. See docs/schema-spec.md.
     """
 
-    _LOCKED_ONCE_CITED_FIELDS = ("archived_storage_key", "content_sha256", "file_size_bytes", "mime_type")
+    LOCKED_ONCE_CITED_FIELDS = ("archived_storage_key", "content_sha256", "file_size_bytes", "mime_type")
 
     class DocumentType(models.TextChoices):
         ORIGINAL_AGREEMENT = "original_agreement", "Original agreement"
@@ -654,7 +692,7 @@ class Document(models.Model):
         if not self._is_cited_by_a_fact():
             return
         previous = type(self).objects.get(pk=self.pk)
-        for field_name in self._LOCKED_ONCE_CITED_FIELDS:
+        for field_name in self.LOCKED_ONCE_CITED_FIELDS:
             if getattr(self, field_name) != getattr(previous, field_name):
                 raise ValidationError(
                     f"'{field_name}' cannot change: this document is cited by a fact. "
@@ -801,12 +839,42 @@ class FactFieldQualifier(models.Model):
 
 class FactQuerySet(models.QuerySet):
     """See registry.services.integrity -- facts are never hard-deleted;
-    retract them instead."""
+    retract them instead.
+
+    update()/bulk_update() also guard Fact.IDENTITY_FIELDS the same way
+    FactField's bulk operations guard machine fields -- Fact.clean() only
+    runs on the ordinary save() path, so these bulk methods would
+    otherwise bypass the identity lock entirely. Unconditional, no
+    escape hatch: unlike FactField's migration-seeding guard, nothing
+    legitimately needs to bulk-edit a fact's identity fields -- the
+    sanctioned lifecycle transitions in registry.services.fact_lifecycle
+    only ever touch the disjoint mutable field set (status, valid_until,
+    retraction_reason, retracted_by, retracted_at) and go through
+    ordinary save(), never these bulk paths.
+    """
 
     def delete(self):
         raise integrity.RecordDeletionNotAllowed(
             "Facts are never hard-deleted in v1 -- retract them instead. See docs/schema-spec.md."
         )
+
+    def update(self, **kwargs):
+        if any(f in kwargs for f in Fact.IDENTITY_FIELD_KWARG_NAMES):
+            raise integrity.LockedFieldMutationNotAllowed(
+                "QuerySet.update() cannot change a fact's evidentiary identity fields -- "
+                "create a replacement fact via registry.services.fact_lifecycle.supersede_fact "
+                "instead."
+            )
+        return super().update(**kwargs)
+
+    def bulk_update(self, objs, fields, **kwargs):
+        if any(f in fields for f in Fact.IDENTITY_FIELD_KWARG_NAMES):
+            raise integrity.LockedFieldMutationNotAllowed(
+                "bulk_update() cannot change a fact's evidentiary identity fields -- "
+                "create a replacement fact via registry.services.fact_lifecycle.supersede_fact "
+                "instead."
+            )
+        return super().bulk_update(objs, fields, **kwargs)
 
     def operative_at(self, agreement, field, as_of, qualifier=None):
         """The fact whose validity interval covers `as_of` for
@@ -899,8 +967,35 @@ class Fact(integrity.UndeletableModelMixin, models.Model):
     primary_document = models.ForeignKey(Document, on_delete=models.PROTECT, related_name="primary_facts")
     page_or_section_reference = models.CharField(max_length=255, blank=True)
     excerpt = models.TextField(blank=True)
+    created_by = models.ForeignKey(Reviewer, on_delete=models.PROTECT, related_name="facts_created")
 
     objects = FactQuerySet.as_manager()
+
+    # Evidentiary identity: never changes once a fact row exists, by
+    # anyone, through any path, with no bypass -- corrections always
+    # create a replacement fact instead (see
+    # registry.services.fact_lifecycle.supersede_fact). Deliberately
+    # excludes status/valid_until/retraction_reason/retracted_by/
+    # retracted_at/supersedes: those are the narrow mutable lifecycle
+    # fields, disjoint from this set by construction. `supersedes` is
+    # set once at creation as part of the supersession action itself and
+    # is not in the mutable set either -- changing which fact something
+    # supersedes after the fact would itself be a change to historical
+    # narrative, not a lifecycle transition.
+    IDENTITY_FIELDS = (
+        "agreement_id", "field_id", "qualifier_id",
+        "value_text", "value_number", "value_date", "value_bool",
+        "scope_period_start", "scope_period_end", "valid_from",
+        "primary_document_id", "page_or_section_reference", "excerpt",
+        "effective_date_basis", "created_by_id",
+    )
+    # update()/bulk_update() accept either the bare FK name or its _id
+    # suffix (Fact.objects.filter(...).update(agreement=x) and
+    # update(agreement_id=x.pk) are both valid Django calls) -- this is
+    # the superset of kwarg/field names FactQuerySet checks against.
+    IDENTITY_FIELD_KWARG_NAMES = frozenset(IDENTITY_FIELDS) | {
+        "agreement", "field", "qualifier", "primary_document", "created_by",
+    }
 
     class Meta:
         constraints = [
@@ -921,37 +1016,57 @@ class Fact(integrity.UndeletableModelMixin, models.Model):
                 condition=models.Q(valid_until__isnull=True) | models.Q(valid_until__gt=models.F("valid_from")),
                 name="fact_valid_until_after_from",
             ),
+            # v1 requires scope_period_start/end to be both null or both
+            # set -- no open-ended scope periods. valid_from/valid_until
+            # already provide open-endedness at the fact level (an
+            # unset valid_until means "still current"); layering a
+            # second, independent open-endedness concept onto
+            # scope_period would be redundant and reopens exactly the
+            # NULL-uniqueness ambiguity this constraint exists to close.
+            # No concrete v1 use case needs it.
             models.CheckConstraint(
                 condition=(
-                    models.Q(scope_period_start__isnull=True) | models.Q(scope_period_end__isnull=True)
-                    | models.Q(scope_period_end__gte=models.F("scope_period_start"))
+                    (models.Q(scope_period_start__isnull=True) & models.Q(scope_period_end__isnull=True))
+                    | (models.Q(scope_period_start__isnull=False) & models.Q(scope_period_end__isnull=False)
+                       & models.Q(scope_period_end__gte=models.F("scope_period_start")))
                 ),
-                name="fact_scope_period_order",
+                name="fact_scope_period_both_or_neither",
             ),
-            # Split in two, like RequiredFactSet's rule constraint: standard
-            # SQL treats NULL as never equal to NULL, so a single combined
-            # UniqueConstraint would silently fail to dedupe the common
-            # case (no qualifier, no scope period -- true of every
-            # machine field today) since qualifier/scope_period_start/
-            # scope_period_end are all nullable. Splitting on whether
-            # qualifier is set covers that case and the qualifier-
-            # differentiated-concurrency case correctly; a fact with
-            # qualifier=NULL but only one of scope_period_start/end set is
-            # a narrow, documented residual gap, not expected in practice
-            # since every allows_multiple_concurrent field in this schema
-            # differentiates by qualifier.
+            # Four partial constraints, one per (qualifier null/not-null)
+            # x (scope_period null/not-null) combination -- standard SQL
+            # treats NULL as never equal to NULL, so any single combined
+            # UniqueConstraint spanning these nullable columns would
+            # silently fail to dedupe whichever combination has NULLs in
+            # both compared rows. Enforcing "both or neither" on
+            # scope_period above makes this a clean 2x2, fully enumerable
+            # without a residual gap.
             models.UniqueConstraint(
                 fields=["agreement", "field", "valid_from"],
                 condition=models.Q(
-                    status="active", qualifier__isnull=True,
-                    scope_period_start__isnull=True, scope_period_end__isnull=True,
+                    status="active", qualifier__isnull=True, scope_period_start__isnull=True,
                 ),
                 name="uniq_active_fact_bare",
             ),
             models.UniqueConstraint(
+                fields=["agreement", "field", "scope_period_start", "scope_period_end", "valid_from"],
+                condition=models.Q(
+                    status="active", qualifier__isnull=True, scope_period_start__isnull=False,
+                ),
+                name="uniq_active_fact_scope_only",
+            ),
+            models.UniqueConstraint(
+                fields=["agreement", "field", "qualifier", "valid_from"],
+                condition=models.Q(
+                    status="active", qualifier__isnull=False, scope_period_start__isnull=True,
+                ),
+                name="uniq_active_fact_qual_only",
+            ),
+            models.UniqueConstraint(
                 fields=["agreement", "field", "qualifier", "scope_period_start", "scope_period_end", "valid_from"],
-                condition=models.Q(status="active", qualifier__isnull=False),
-                name="uniq_active_fact_qualified",
+                condition=models.Q(
+                    status="active", qualifier__isnull=False, scope_period_start__isnull=False,
+                ),
+                name="uniq_active_fact_qual_scope",
             ),
         ]
         indexes = [
@@ -965,12 +1080,38 @@ class Fact(integrity.UndeletableModelMixin, models.Model):
         return f"{self.agreement} / {self.field.code} (valid_from={self.valid_from})"
 
     def clean(self):
+        self._check_identity_unchanged_if_existing()
         self._check_exactly_one_value_matches_type()
         self._check_qualifier_belongs_to_field()
+        self._check_scope_period_both_or_neither()
         self._check_effective_date_basis_against_document_dates()
         self._check_retraction_reason_required()
         self._check_no_illegitimate_concurrency()
         self._check_supersession_target_consistency()
+
+    def _check_identity_unchanged_if_existing(self):
+        if not self.pk:
+            return
+        previous = type(self)._base_manager.get(pk=self.pk)
+        changed = [f for f in self.IDENTITY_FIELDS if getattr(self, f) != getattr(previous, f)]
+        if changed:
+            raise ValidationError(
+                f"Cannot change {changed} on an existing fact -- its evidentiary identity is "
+                "immutable once created. Create a replacement fact via "
+                "registry.services.fact_lifecycle.supersede_fact instead."
+            )
+
+    def _check_scope_period_both_or_neither(self):
+        if (self.scope_period_start is None) != (self.scope_period_end is None):
+            raise ValidationError(
+                "scope_period_start and scope_period_end must be either both set or both null."
+            )
+        if (
+            self.scope_period_start is not None
+            and self.scope_period_end is not None
+            and self.scope_period_end < self.scope_period_start
+        ):
+            raise ValidationError("scope_period_end cannot be before scope_period_start.")
 
     def _check_exactly_one_value_matches_type(self):
         values = dict(

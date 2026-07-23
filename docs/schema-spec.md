@@ -541,6 +541,80 @@ opportunities, public pages, submissions, subscriptions, alerts, exports.
   `submission` doesn't exist yet, and is deferred rather than
   approximated now.
 
+## Implementation notes: integrity-hardening pass
+
+A bounded pass closing three gaps in the fact/verification slice that
+relied on `clean()` alone, before starting deadline computation. No
+conceptual schema change -- field-level and structural design are as
+already frozen; this pass is entirely about *how many independent layers*
+enforce what was already decided.
+
+- **Cited-document field lock is now three layers, not one.**
+  `Document.clean()` (value-differs check, save() path only) was joined
+  by `DocumentQuerySet.update()`/`bulk_update()` guards (unconditional --
+  block any touch to a locked field on a cited document, whether or not
+  the resulting value would differ, since bulk operations have no
+  legitimate reason to touch these fields on a cited row at all) and a
+  Postgres `BEFORE UPDATE` trigger on `registry_document`
+  (`registry/migrations/0007`) that fires regardless of connected role,
+  independent of Django entirely. `wayback_*` fields are exempt at every
+  layer -- the trigger doesn't inspect them, and the QuerySet guards only
+  check `LOCKED_ONCE_CITED_FIELDS`.
+- **Fact evidentiary identity is now an explicit, named, three-layer
+  lock**, not an implicit convention. `Fact.IDENTITY_FIELDS` (agreement,
+  field, qualifier, the typed value, scope_period, valid_from,
+  primary_document, page_or_section_reference, excerpt,
+  effective_date_basis, `created_by` -- added this pass, since attributing
+  who entered a fact belongs with the rest of its evidentiary identity)
+  is checked in `clean()` against the row's actual current DB values (via
+  `_base_manager` to avoid any manager-level interference), in
+  `FactQuerySet.update()`/`bulk_update()` (checking both the bare and
+  `_id`-suffixed kwarg names Django accepts for FK fields), and in a
+  Postgres `BEFORE UPDATE` trigger (`registry/migrations/0008`). All three
+  are unconditional, no escape hatch: the mutable lifecycle field set
+  (`status`, `valid_until`, `retraction_reason`, `retracted_by`,
+  `retracted_at`) is disjoint from the identity set by construction, so
+  the two sanctioned domain-service functions in
+  `registry/services/fact_lifecycle.py` (`retract_fact`, `supersede_fact`)
+  never need to bypass any of the three layers -- they only ever touch
+  fields none of the guards inspect. `supersedes` is deliberately *not* in
+  the mutable set: it is set once at creation as part of the supersession
+  action itself, and changing which fact something supersedes after the
+  fact would itself be a change to historical narrative, not a lifecycle
+  transition.
+- **Scope-period is now "both set or both null," closing the residual
+  gap the previous pass documented and accepted.** A fact with
+  `qualifier=NULL` and only one of `scope_period_start`/`scope_period_end`
+  set is no longer possible at all (`fact_scope_period_both_or_neither`
+  CHECK constraint), which turns the qualifier x scope_period nullability
+  space into a clean 2x2 -- the active-fact uniqueness constraint is now
+  four partial constraints, one per combination
+  (`uniq_active_fact_bare`, `uniq_active_fact_scope_only`,
+  `uniq_active_fact_qual_only`, `uniq_active_fact_qual_scope`), with no
+  remaining gap. Open-ended scope periods were considered and rejected:
+  `valid_from`/`valid_until` already provide open-endedness at the fact
+  level, a second independent open-endedness concept on `scope_period`
+  would be redundant, and no concrete v1 use case needs it.
+- **Temporal overlap prevention (`allows_multiple_concurrent=False`
+  fields) remains application-only** -- `Fact.clean()`'s
+  `_check_no_illegitimate_concurrency` is a Python loop over existing
+  active facts, not a database constraint. This is a real, current gap:
+  two concurrent requests could each individually pass the check against
+  a snapshot that doesn't yet include the other's row, then both commit,
+  producing an actual overlap despite the guard. It matters little today
+  (single-actor, admin-driven data entry, effectively serialized in
+  practice) but would matter as soon as public submissions introduce
+  genuinely concurrent writers. **Recommendation: add a Postgres
+  exclusion constraint** (`EXCLUDE USING gist`, requiring the `btree_gist`
+  extension, on `(agreement_id, field_id) WITH =, daterange(valid_from,
+  valid_until) WITH &&`, scoped to `allows_multiple_concurrent=False`
+  fields and `status='active'`) **before public submissions are enabled**
+  -- not implemented in this pass, since it's a genuine, self-contained
+  addition, not a fix for something broken today, and `btree_gist`
+  requires a Postgres role with `CREATE EXTENSION` privilege, which not
+  every managed Postgres provider grants by default and is worth
+  confirming availability for ahead of time.
+
 ## Milestones
 
 - **Milestone 1 (technical deployment):** full schema, deadline engine

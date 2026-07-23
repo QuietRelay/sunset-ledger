@@ -1,16 +1,26 @@
 import datetime
+import uuid
 
 import pytest
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 
-from registry.models import Fact, FactField, FactFieldQualifier
+from registry.models import Fact, FactField, FactFieldQualifier, Reviewer
 from registry.services.integrity import RecordDeletionNotAllowed
 
 pytestmark = pytest.mark.django_db
 
 
 def make_fact(agreement, field, document, **overrides):
+    # created_by is required but not what most of these tests are about --
+    # auto-create a throwaway reviewer unless the caller specifically
+    # supplies one, rather than threading a `reviewer` fixture through
+    # every test function's signature and every make_fact() call site.
+    overrides.setdefault("created_by", Reviewer.objects.create(
+        display_name=f"Auto reviewer {uuid.uuid4()}",
+        contact_email=f"auto-{uuid.uuid4()}@example.org",
+        role=Reviewer.Role.TRUSTED_REVIEWER,
+    ))
     defaults = dict(
         agreement=agreement, field=field, primary_document=document,
         valid_from=datetime.date(2024, 1, 1),
@@ -36,21 +46,23 @@ class TestExactlyOneValue:
         )
         assert fact.value_number == 90
 
-    def test_more_than_one_value_populated_rejected(self, agreement, end_date_field, document):
+    def test_more_than_one_value_populated_rejected(self, agreement, end_date_field, document, reviewer):
         fact = Fact(
             agreement=agreement, field=end_date_field, primary_document=document,
             valid_from=datetime.date(2024, 1, 1),
             effective_date_basis=Fact.EffectiveDateBasis.STATED_IN_DOCUMENT,
             value_date=datetime.date(2026, 1, 1), value_text="also set",
+            created_by=reviewer,
         )
         with pytest.raises(ValidationError):
             fact.save()
 
-    def test_zero_values_populated_rejected(self, agreement, end_date_field, document):
+    def test_zero_values_populated_rejected(self, agreement, end_date_field, document, reviewer):
         fact = Fact(
             agreement=agreement, field=end_date_field, primary_document=document,
             valid_from=datetime.date(2024, 1, 1),
             effective_date_basis=Fact.EffectiveDateBasis.STATED_IN_DOCUMENT,
+            created_by=reviewer,
         )
         with pytest.raises(ValidationError):
             fact.save()
@@ -66,7 +78,7 @@ class TestExactlyOneValue:
         assert fact.value_bool is False
 
     def test_exactly_one_value_enforced_at_database_level_independent_of_validation(
-        self, agreement, end_date_field, document,
+        self, agreement, end_date_field, document, reviewer,
     ):
         # Bypasses full_clean() via bulk_create() to prove the CHECK
         # constraint itself rejects a zero-values-set row, not merely the
@@ -77,6 +89,7 @@ class TestExactlyOneValue:
                     agreement=agreement, field=end_date_field, primary_document=document,
                     valid_from=datetime.date(2024, 1, 1),
                     effective_date_basis=Fact.EffectiveDateBasis.STATED_IN_DOCUMENT,
+                    created_by=reviewer,
                 )])
 
 
@@ -100,7 +113,7 @@ class TestQualifierBelongsToField:
 
 
 class TestBareDuplicatePreventionAcrossNullQualifierAndScope:
-    def test_exact_bare_duplicate_rejected_at_database_level(self, agreement, document):
+    def test_exact_bare_duplicate_rejected_at_database_level(self, agreement, document, reviewer):
         # Uses a field with allows_multiple_concurrent=True and no
         # qualifier/scope_period set on either fact, specifically to
         # isolate the database constraint from
@@ -118,6 +131,7 @@ class TestBareDuplicatePreventionAcrossNullQualifierAndScope:
             agreement=agreement, field=field, primary_document=document, value_number=5,
             valid_from=datetime.date(2024, 1, 1),
             effective_date_basis=Fact.EffectiveDateBasis.STATED_IN_DOCUMENT,
+            created_by=reviewer,
         )])
         with pytest.raises(IntegrityError):
             with transaction.atomic():
@@ -125,20 +139,22 @@ class TestBareDuplicatePreventionAcrossNullQualifierAndScope:
                     agreement=agreement, field=field, primary_document=document, value_number=7,
                     valid_from=datetime.date(2024, 1, 1),
                     effective_date_basis=Fact.EffectiveDateBasis.STATED_IN_DOCUMENT,
+                    created_by=reviewer,
                 )])
 
 
 class TestTemporalSemantics:
-    def test_valid_until_must_be_after_valid_from(self, agreement, end_date_field, document):
+    def test_valid_until_must_be_after_valid_from(self, agreement, end_date_field, document, reviewer):
         with pytest.raises(ValidationError):
             Fact(
                 agreement=agreement, field=end_date_field, primary_document=document,
                 value_date=datetime.date(2026, 1, 1),
                 valid_from=datetime.date(2024, 6, 1), valid_until=datetime.date(2024, 1, 1),
                 effective_date_basis=Fact.EffectiveDateBasis.STATED_IN_DOCUMENT,
+                created_by=reviewer,
             ).save()
 
-    def test_valid_until_ordering_enforced_at_database_level(self, agreement, end_date_field, document):
+    def test_valid_until_ordering_enforced_at_database_level(self, agreement, end_date_field, document, reviewer):
         with pytest.raises(IntegrityError):
             with transaction.atomic():
                 Fact._base_manager.bulk_create([Fact(
@@ -146,6 +162,7 @@ class TestTemporalSemantics:
                     value_date=datetime.date(2026, 1, 1),
                     valid_from=datetime.date(2024, 6, 1), valid_until=datetime.date(2024, 1, 1),
                     effective_date_basis=Fact.EffectiveDateBasis.STATED_IN_DOCUMENT,
+                    created_by=reviewer,
                 )])
 
     def test_open_ended_valid_until_permitted(self, agreement, end_date_field, document):
@@ -162,6 +179,81 @@ class TestTemporalSemantics:
                 agreement, annual_value_field, document, value_number=1000,
                 scope_period_start=datetime.date(2025, 1, 1), scope_period_end=datetime.date(2024, 1, 1),
             )
+
+    def test_scope_period_partially_set_rejected(self, agreement, document):
+        # v1 requires scope_period_start/end to be both set or both null
+        # -- no open-ended scope periods. valid_from/valid_until already
+        # provide open-endedness at the fact level; a partially-set scope
+        # period is exactly the ambiguity that previously left a real
+        # NULL-uniqueness gap.
+        annual_value_field = FactField.objects.create(
+            code="annual_value_partial_test", category=FactField.Category.DESCRIPTIVE,
+            value_type=FactField.ValueType.NUMBER, allows_multiple_concurrent=True,
+        )
+        with pytest.raises(ValidationError):
+            make_fact(
+                agreement, annual_value_field, document, value_number=1000,
+                scope_period_start=datetime.date(2025, 1, 1), scope_period_end=None,
+            )
+        with pytest.raises(ValidationError):
+            make_fact(
+                agreement, annual_value_field, document, value_number=1000,
+                scope_period_start=None, scope_period_end=datetime.date(2025, 12, 31),
+            )
+
+    def test_scope_period_partially_set_rejected_at_database_level(self, agreement, document, reviewer):
+        annual_value_field = FactField.objects.create(
+            code="annual_value_partial_db_test", category=FactField.Category.DESCRIPTIVE,
+            value_type=FactField.ValueType.NUMBER, allows_multiple_concurrent=True,
+        )
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                Fact._base_manager.bulk_create([Fact(
+                    agreement=agreement, field=annual_value_field, primary_document=document,
+                    value_number=1000, valid_from=datetime.date(2024, 1, 1),
+                    effective_date_basis=Fact.EffectiveDateBasis.STATED_IN_DOCUMENT,
+                    scope_period_start=datetime.date(2025, 1, 1), scope_period_end=None,
+                    created_by=reviewer,
+                )])
+
+    def test_qualifier_null_scope_period_set_dedupes_correctly(self, agreement, document):
+        # The specific residual case the four-way constraint split closes:
+        # qualifier=NULL, scope_period set (not paired with a qualifier).
+        field = FactField.objects.create(
+            code="scope_only_dedup_test", category=FactField.Category.DESCRIPTIVE,
+            value_type=FactField.ValueType.NUMBER, allows_multiple_concurrent=True,
+        )
+        make_fact(
+            agreement, field, document, value_number=100,
+            scope_period_start=datetime.date(2025, 1, 1), scope_period_end=datetime.date(2025, 12, 31),
+        )
+        with pytest.raises(ValidationError):
+            make_fact(
+                agreement, field, document, value_number=200,
+                scope_period_start=datetime.date(2025, 1, 1), scope_period_end=datetime.date(2025, 12, 31),
+            )
+
+    def test_qualifier_null_scope_period_set_dedupes_at_database_level(self, agreement, document, reviewer):
+        field = FactField.objects.create(
+            code="scope_only_dedup_db_test", category=FactField.Category.DESCRIPTIVE,
+            value_type=FactField.ValueType.NUMBER, allows_multiple_concurrent=True,
+        )
+        Fact._base_manager.bulk_create([Fact(
+            agreement=agreement, field=field, primary_document=document, value_number=100,
+            valid_from=datetime.date(2024, 1, 1),
+            effective_date_basis=Fact.EffectiveDateBasis.STATED_IN_DOCUMENT,
+            scope_period_start=datetime.date(2025, 1, 1), scope_period_end=datetime.date(2025, 12, 31),
+            created_by=reviewer,
+        )])
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                Fact._base_manager.bulk_create([Fact(
+                    agreement=agreement, field=field, primary_document=document, value_number=200,
+                    valid_from=datetime.date(2024, 1, 1),
+                    effective_date_basis=Fact.EffectiveDateBasis.STATED_IN_DOCUMENT,
+                    scope_period_start=datetime.date(2025, 1, 1), scope_period_end=datetime.date(2025, 12, 31),
+                    created_by=reviewer,
+                )])
 
     def test_operative_at_resolves_the_fact_whose_interval_covers_the_date(
         self, agreement, end_date_field, document,

@@ -1,15 +1,21 @@
 import datetime
+import uuid
 
 import pytest
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 
-from registry.models import Document, Fact, FactCorroboration
+from registry.models import Document, Fact, FactCorroboration, Reviewer
 
 pytestmark = pytest.mark.django_db
 
 
 def make_fact(agreement, field, document, **overrides):
+    overrides.setdefault("created_by", Reviewer.objects.create(
+        display_name=f"Auto reviewer {uuid.uuid4()}",
+        contact_email=f"auto-{uuid.uuid4()}@example.org",
+        role=Reviewer.Role.TRUSTED_REVIEWER,
+    ))
     defaults = dict(
         agreement=agreement, field=field, primary_document=document,
         valid_from=datetime.date(2024, 1, 1),
